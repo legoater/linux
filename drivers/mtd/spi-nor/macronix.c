@@ -39,8 +39,10 @@ mx25l25635_post_bfpt_fixups(struct spi_nor *nor,
 	 * seems that the F version advertises support for Fast Read 4-4-4 in
 	 * its BFPT table.
 	 */
-	if (bfpt->dwords[SFDP_DWORD(5)] & BFPT_DWORD5_FAST_READ_4_4_4)
+	if (bfpt->dwords[SFDP_DWORD(5)] & BFPT_DWORD5_FAST_READ_4_4_4) {
+		dev_dbg(nor->dev, "MX25L25635F with 4B opcodes support\n");
 		nor->flags |= SNOR_F_4B_OPCODES;
+	}
 
 	return 0;
 }
