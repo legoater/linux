@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright 2021 IBM Corp.
+
+#include "aspeed-ast2600-evb.dts"
+
+/ {
+	model = "AST2600 A0 EVB";
+};
+
+/delete-node/ &mac0;
+
+&fmc {
+	flash@0 {
+		spi-rx-bus-width = <2>;
+		spi-max-frequency = <50000000>;
+	};
+};
