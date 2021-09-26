@@ -959,6 +959,8 @@ patternProperties:
     description: OpenCores.org
   "^openembed,.*":
     description: OpenEmbed
+  "^openpower,.*":
+    description: OpenPower
   "^openrisc,.*":
     description: OpenRISC.io
   "^option,.*":
