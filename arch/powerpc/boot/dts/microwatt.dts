@@ -127,6 +127,46 @@
 			#interrupt-cells = <2>;
 		};
 
+		spi@6000 {
+			compatible = "openpower,microwatt-spi";
+			reg = <0x6000     0x100
+			       0x30000000 0x8000000 >;
+                        clocks = <&sys_clk>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			flash@0 {
+				reg = < 0 >;
+				compatible = "jedec,spi-nor";
+				spi-max-frequency = <50000000>;
+				status = "ok";
+				partitions {
+					compatible = "fixed-partitions";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					sdram-init@0 {
+						 reg = <0x0 0x100000>;
+						 label = "sdram-init";
+					};
+
+					spare@100000 {
+						 reg = <0x100000 0x300000>;
+						 label = "spare";
+					};
+
+					kernel@400000 {
+						 reg = <0x400000 0x800000>;
+						 label = "kernel";
+					};
+
+					spare2@c00000 {
+						 reg = <0xc00000 0x400000>;
+						 label = "spare2";
+					};
+				};
+			};
+		};
+
 		UART0: serial@2000 {
 			device_type = "serial";
 			compatible = "ns16550";
