@@ -6,6 +6,8 @@
  * Copyright (c) 2020-2022, ASPEED Corporation.
  */
 
+#define VERBOSE_DEBUG
+
 #include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/module.h>
