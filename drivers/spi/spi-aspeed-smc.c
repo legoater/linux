@@ -7,6 +7,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/debugfs.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -102,6 +103,9 @@ struct aspeed_spi {
 	u32			 clk_freq;
 
 	struct aspeed_spi_chip	 chips[ASPEED_SPI_MAX_NUM_CS];
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	struct dentry           *debugfs;
+#endif
 };
 
 static u32 aspeed_spi_get_io_mode(const struct spi_mem_op *op)
@@ -712,6 +716,65 @@ static void aspeed_spi_enable(struct aspeed_spi *aspi, bool enable)
 		aspeed_spi_chip_enable(aspi, cs, enable);
 }
 
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+static int aspeed_spi_ranges_debug_show(struct seq_file *m, void *private)
+{
+	struct aspeed_spi *aspi = m->private;
+	struct aspeed_spi_window windows[ASPEED_SPI_MAX_NUM_CS] = { 0 };
+	u32 cs;
+
+	if (aspi->data == &ast2400_spi_data)
+		return 0;
+
+	aspeed_spi_get_windows(aspi, windows);
+
+	seq_puts(m, "     offset     size       register\n");
+	for (cs = 0; cs < aspi->data->max_cs; cs++) {
+		if (!windows[cs].reg)
+			seq_printf(m, "CE%d: disabled\n", cs);
+		else
+			seq_printf(m, "CE%d: 0x%.8x 0x%.8x 0x%x\n", cs,
+				   windows[cs].offset, windows[cs].size,
+				   windows[cs].reg);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(aspeed_spi_ranges_debug);
+
+static int aspeed_spi_debugfs_init(struct spi_controller *ctlr)
+{
+	struct aspeed_spi *aspi = spi_controller_get_devdata(ctlr);
+	struct dentry *rootdir = NULL;
+
+	rootdir = debugfs_lookup("spi", NULL);
+	if (!rootdir)
+		rootdir = debugfs_create_dir("spi", NULL);
+
+	aspi->debugfs = debugfs_create_dir(dev_name(&ctlr->dev), rootdir);
+	if (!aspi->debugfs)
+		return -ENOMEM;
+
+	debugfs_create_file("ranges", 0444, aspi->debugfs, (void *)aspi,
+			    &aspeed_spi_ranges_debug_fops);
+	return 0;
+}
+
+static void aspeed_spi_debugfs_remove(struct aspeed_spi *aspi)
+{
+	debugfs_remove_recursive(aspi->debugfs);
+}
+
+#else
+static inline int aspeed_spi_debugfs_init(struct spi_controller *ctlr)
+{
+	return 0;
+}
+
+static inline void aspeed_spi_debugfs_remove(struct aspeed_spi *aspi)
+{
+}
+#endif /* IS_ENABLED(CONFIG_DEBUG_FS) */
+
 static int aspeed_spi_chip_read_ranges(struct device_node *node, struct aspeed_spi *aspi)
 {
 	const char *range_prop = "ranges";
@@ -829,16 +892,19 @@ static int aspeed_spi_probe(struct platform_device *pdev)
 	ctlr->dev.of_node = dev->of_node;
 
 	ret = devm_spi_register_controller(dev, ctlr);
-	if (ret)
+	if (ret) {
 		dev_err(&pdev->dev, "spi_register_controller failed\n");
+		return ret;
+	}
 
-	return ret;
+	return aspeed_spi_debugfs_init(ctlr);
 }
 
 static void aspeed_spi_remove(struct platform_device *pdev)
 {
 	struct aspeed_spi *aspi = platform_get_drvdata(pdev);
 
+	aspeed_spi_debugfs_remove(aspi);
 	aspeed_spi_enable(aspi, false);
 }
 
