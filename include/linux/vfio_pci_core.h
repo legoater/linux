@@ -94,6 +94,11 @@ struct vfio_pci_core_device {
 	struct vfio_pci_core_device	*sriov_pf_core_dev;
 	struct notifier_block	nb;
 	struct rw_semaphore	memory_lock;
+
+	struct {
+		u64 		faults;
+		u64 		zap;
+	} stat;
 };
 
 /* Will be exported for vfio pci drivers usage */

@@ -12,6 +12,7 @@
 
 #include <linux/aperture.h>
 #include <linux/device.h>
+#include <linux/debugfs.h>
 #include <linux/eventfd.h>
 #include <linux/file.h>
 #include <linux/interrupt.h>
@@ -1618,6 +1619,7 @@ static void vfio_pci_zap_bars(struct vfio_pci_core_device *vdev)
 	loff_t len = end - start;
 
 	unmap_mapping_range(core_vdev->inode->i_mapping, start, len, true);
+	vdev->stat.zap++;
 }
 
 void vfio_pci_zap_and_down_write_memory_lock(struct vfio_pci_core_device *vdev)
@@ -1687,6 +1689,8 @@ static vm_fault_t vfio_pci_mmap_fault(struct vm_fault *vmf)
 		if (vmf_insert_pfn(vma, addr, pfn) & VM_FAULT_ERROR)
 			break;
 	}
+
+	vdev->stat.faults++;
 
 out_unlock:
 	up_read(&vdev->memory_lock);
@@ -2068,6 +2072,37 @@ static void vfio_pci_vga_uninit(struct vfio_pci_core_device *vdev)
 					      VGA_RSRC_LEGACY_MEM);
 }
 
+#ifdef CONFIG_DEBUG_FS
+static int vfio_pci_dev_faults_show(struct seq_file *m, void *data)
+{
+	struct vfio_pci_core_device *vdev = m->private;
+
+	seq_printf(m, "%lld\n", vdev->stat.faults);
+	return 0;
+}
+
+static int vfio_pci_dev_zap_show(struct seq_file *m, void *data)
+{
+	struct vfio_pci_core_device *vdev = m->private;
+
+	seq_printf(m, "%lld\n", vdev->stat.zap);
+	return 0;
+}
+
+static void vfio_pci_debugfs_create(struct vfio_pci_core_device *pci_vdev)
+{
+	struct vfio_device *vdev = &pci_vdev->vdev;
+	struct device *dev = &vdev->device;
+	struct dentry *debug_dir = vdev->debug_root;
+
+	debugfs_create_devm_seqfile(dev, "faults", debug_dir, vfio_pci_dev_faults_show);
+	debugfs_create_devm_seqfile(dev, "zap", debug_dir, vfio_pci_dev_zap_show);
+}
+
+#else
+static inline void vfio_pci_debugfs_create(struct vfio_pci_core_device *vdev) { }
+#endif /* CONFIG_DEBUG_FS */
+
 int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 {
 	struct vfio_pci_core_device *vdev =
@@ -2181,6 +2216,8 @@ int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev)
 	ret = vfio_register_group_dev(&vdev->vdev);
 	if (ret)
 		goto out_power;
+
+	vfio_pci_debugfs_create(vdev);
 	return 0;
 
 out_power:
