@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config E1000E_VFIO_PCI
+	tristate "Generic VFIO PCI extensions for e1000e ethernet adapters"
+	default y
+	help
+	  Support for Intel E1000E specific extensions to enable direct
+	  assignment to virtual machines.
+
+	  To enable Intel E1000E assignment through vfio-pci-e1000e, say Y.

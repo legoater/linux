@@ -8,6 +8,8 @@ vfio-pci-y := vfio_pci.o
 vfio-pci-$(CONFIG_VFIO_PCI_IGD) += vfio_pci_igd.o
 obj-$(CONFIG_VFIO_PCI) += vfio-pci.o
 
+obj-$(CONFIG_E1000E_VFIO_PCI) += e1000e/
+
 obj-$(CONFIG_IGBVF_VFIO_PCI) += igb/
 
 obj-$(CONFIG_MLX5_VFIO_PCI)           += mlx5/
