@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config IGBVF_VFIO_PCI
+	tristate "Generic VFIO PCI extensions for igb virtual function"
+	default y
+	help
+	  Support for Intel IGB specific extensions to enable direct
+	  assignment to virtual machines.
+
+	  To enable Intel IGB
