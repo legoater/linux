@@ -348,3 +348,7 @@
 	status = "okay";
 	memory-region = <&gfx_memory>;
 };
+
+&uhci {
+	status = "okay";
+};
