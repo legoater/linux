@@ -191,6 +191,15 @@ config PCIE_ALTERA_MSI
 	  Say Y here if you want PCIe MSI support for the Altera FPGA.
 	  This MSI driver supports Altera MSI to GIC controller IP.
 
+config PCIE_ASPEED
+	bool "ASPEED PCIe controller"
+	depends on PCI
+	depends on OF || COMPILE_TEST
+	select PCI_MSI_ARCH_FALLBACKS
+	help
+	  Say Y here if you want PCIe controller support on
+	  ASPEED SoCs.
+
 config PCI_HOST_THUNDER_PEM
 	bool "Cavium Thunder PCIe controller to off-chip devices"
 	depends on ARM64 || COMPILE_TEST

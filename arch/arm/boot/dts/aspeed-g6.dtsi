@@ -98,6 +98,11 @@
 			    <0x40466000 0x2000>;
 			};
 
+		ahbc: ahbc@1e600000 {
+			compatible = "aspeed,aspeed-ahbc", "syscon";
+			reg = < 0x1e600000 0x100>;
+		};
+
 		fmc: spi@1e620000 {
 			reg = <0x1e620000 0xc4>, <0x20000000 0x10000000>;
 			#address-cells = <1>;
@@ -382,6 +387,98 @@
 				quality = <100>;
 			};
 
+			pcie_phy0: pcie_phy@1e6ed000 {
+				compatible = "aspeed,ast2600-pcie-phy", "syscon";
+				reg = <0x1e6ed000 0x100>;
+			};
+
+			pcie_phy1: rc_bridge@1e6ed200 {
+				compatible = "aspeed,ast2600-pcie-phy", "syscon";
+				reg = <0x1e6ed200 0x100>;
+			};
+
+			pciecfg: pciecfg@1e770000 {
+				compatible = "aspeed,ast2600-pciecfg", "syscon";
+				reg = <0x1e770000 0x80>;
+				resets = <&syscon ASPEED_RESET_H2X>, <&syscon ASPEED_RESET_PCIE_DEV_O>, <&syscon ASPEED_RESET_PCIE_RC_O>;
+				reset-names = "h2x", "rc_low", "rc_high";
+				aspeed,ahbc = <&ahbc>;
+				aspeed,pcie0 = <&pcie0>;
+				aspeed,pcie1 = <&pcie1>;
+
+				status = "disabled";
+			};
+
+			pcie0: pcie@1e770080 {
+				compatible = "aspeed,ast2600-pcie";
+				device_type = "pci";
+				reg = <0x1e770080 0x40>;
+				linux,pci-domain = <0>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				interrupt-parent = <&gic>;
+				interrupts = <GIC_SPI 167 IRQ_TYPE_LEVEL_HIGH>;
+				bus-range = <0x00 0x7f>;
+				ranges = <0x01000000 0   0x00000000 0x00000000 0x0    0x08000   /* I/O */
+					  0x02000000 0x0 0x60000000 0x60000000 0   0x10000000>; /* memory */
+
+				status = "disabled";
+
+				resets = <&syscon ASPEED_RESET_PCIE_DEV_O>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&pinctrl_pcierc0_default>;
+
+				#interrupt-cells = <1>;
+				msi-parent = <&pcie0>;
+				msi_address = <0x1e770058>;
+				pciephy = <&pcie_phy0>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &pcie_intc0 0>,
+						<0 0 0 2 &pcie_intc0 1>,
+						<0 0 0 3 &pcie_intc0 2>,
+						<0 0 0 4 &pcie_intc0 3>;
+				pcie_intc0: interrupt-controller {
+					interrupt-controller;
+					#address-cells = <0>;
+					#interrupt-cells = <1>;
+				};
+			};
+
+			pcie1: pcie@1e7700C0 {
+				compatible = "aspeed,ast2600-pcie";
+				device_type = "pci";
+				reg = <0x1e7700C0 0x40>;
+				linux,pci-domain = <1>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				interrupts = <GIC_SPI 168 IRQ_TYPE_LEVEL_HIGH>;
+				bus-range = <0x80 0xff>;
+
+				ranges = <0x01000000 0 0x00018000 0x00018000 0x0 0x08000
+					0x02000000 0x0 0x70000000 0x70000000 0 0x10000000>; /* memory */
+
+				status = "disabled";
+
+				resets = <&syscon ASPEED_RESET_PCIE_RC_O>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&pinctrl_pcierc1_default>;
+
+				#interrupt-cells = <1>;
+				msi-parent = <&pcie1>;
+				msi_address = <0x1e77005C>;
+				pciephy = <&pcie_phy1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &pcie_intc1 0>,
+						<0 0 0 2 &pcie_intc1 1>,
+						<0 0 0 3 &pcie_intc1 2>,
+						<0 0 0 4 &pcie_intc1 3>;
+				pcie_intc1: interrupt-controller {
+					interrupt-controller;
+					#address-cells = <0>;
+					#interrupt-cells = <1>;
+				};
+			};
+
 			gfx: display@1e6e6000 {
 				compatible = "aspeed,ast2600-gfx", "syscon";
 				reg = <0x1e6e6000 0x1000>;
@@ -656,6 +753,69 @@
 					clocks = <&syscon ASPEED_CLK_GATE_LCLK>;
 					status = "disabled";
 				};
+			};
+
+			pcie_lpc: pcie-lpc@1e789800 {
+				compatible = "aspeed,ast2600-pcie-lpc", "simple-mfd", "syscon";
+				reg = <0x1e789800 0x800>;
+
+				#address-cells = <1>;
+				#size-cells = <1>;
+				ranges = <0x0 0x1e789800 0x800>;
+
+				pcie_kcs1: pcie-kcs1@0 {
+					compatible = "aspeed,ast2600-kcs-bmc";
+					reg = <0x0 0x130>;
+					interrupts = <GIC_SPI 174 IRQ_TYPE_LEVEL_HIGH>;
+					kcs_chan = <6>;
+					status = "disabled";
+				};
+
+				pcie_kcs2: pcie-kcs2@0 {
+					compatible = "aspeed,ast2600-kcs-bmc";
+					reg = <0x0 0x130>;
+					interrupts = <GIC_SPI 175 IRQ_TYPE_LEVEL_HIGH>;
+					kcs_chan = <7>;
+					status = "disabled";
+				};
+
+				pcie_kcs3: pcie-kcs3@0 {
+					compatible = "aspeed,ast2600-kcs-bmc";
+					reg = <0x0 0x130>;
+					interrupts = <GIC_SPI 176 IRQ_TYPE_LEVEL_HIGH>;
+					kcs_chan = <8>;
+					status = "disabled";
+				};
+
+				pcie_kcs4: pcie-kcs4@0 {
+					compatible = "aspeed,ast2600-kcs-bmc";
+					reg = <0x0 0x130>;
+					interrupts = <GIC_SPI 177 IRQ_TYPE_LEVEL_HIGH>;
+					kcs_chan = <9>;
+					status = "disabled";
+				};
+
+				pcie_snoop: pcie-snoop@80 {
+					compatible = "aspeed,ast2600-lpc-snoop";
+					reg = <0x80 0x80>;
+					interrupts = <GIC_SPI 171 IRQ_TYPE_LEVEL_HIGH>;
+					status = "disabled";
+				};
+
+				pcie_pcc: pcie-pcc@0 {
+					compatible = "aspeed,ast2600-lpc-pcc";
+					reg = <0x0 0x140>;
+					interrupts = <GIC_SPI 173 IRQ_TYPE_LEVEL_HIGH>;
+					status = "disabled";
+				};
+
+				pcie_ibt: pcie_ibt@140 {
+					compatible = "aspeed,ast2600-ibt-bmc";
+					reg = <0x140 0x18>;
+					interrupts = <GIC_SPI 172 IRQ_TYPE_LEVEL_HIGH>;
+					status = "disabled";
+				};
+
 			};
 
 			sdc: sdc@1e740000 {
