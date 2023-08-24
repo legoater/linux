@@ -662,8 +662,8 @@ static int aspeed_pcie_init_irq_domain(struct aspeed_pcie *pcie)
 	of_node_put(pcie_intc_node);
 
 	//080 can't config for msi
-	if (pcie->domain)
-		return 0;
+//	if (pcie->domain)
+//		return 0;
 
 #ifdef CONFIG_PCI_MSI
 	pcie->dev_domain = irq_domain_add_linear(NULL, MAX_MSI_HOST_IRQS, &aspeed_msi_domain_ops, pcie);
