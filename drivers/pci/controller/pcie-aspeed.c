@@ -294,7 +294,7 @@ static int aspeed_h2x_rd_conf(struct pci_bus *bus, unsigned int devfn,
 		break;
 	}
 
-//	printk("[%d]R:b d f [%d:%d:%d] devfn %x\n", pcie->domain, bus->number, PCI_SLOT(devfn), PCI_FUNC(devfn), devfn);
+	dev_dbg(pcie->dev, "read %x:%x sz:%d @%x\n", bus->number, devfn, size, where);
 
 	if (type) {
 		regmap_read(pcie->pciephy, ASPEED_PCIE_LINK, &link_sts);
@@ -376,7 +376,8 @@ static int aspeed_h2x_rd_conf(struct pci_bus *bus, unsigned int devfn,
 		*val = (*val >> ((where & 2) * 8)) & 0xffff;
 		break;
 	}
-//	printk("R:b d f [%d:%d:%d] where:%x : %x\n", bus->number, PCI_SLOT(devfn), PCI_FUNC(devfn), where, *val);
+	dev_dbg(pcie->dev, "read %x:%x sz:%d @%x -> %x\n",
+		bus->number, devfn, size, where, *val);
 
 #ifdef CONFIG_HOTPLUG_PCI
 	switch (pcie->domain) {
@@ -488,6 +489,9 @@ aspeed_h2x_wr_conf(struct pci_bus *bus, unsigned int devfn,
 			type = 0;
 		break;
 	}
+
+	dev_dbg(pcie->dev, "write %x:%x sz:%d @%x <- %x (byte_en:%d)\n",
+		bus->number, devfn, size, where, val, byte_en);
 
 	bdf_offset = (bus->number << 24) | (PCI_SLOT(devfn) << 19) |
 					(PCI_FUNC(devfn) << 16) | (where & ~3);
