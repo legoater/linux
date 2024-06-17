@@ -23,8 +23,10 @@
 
 #include <linux/compat.h>
 #include <linux/device.h>
+#include <linux/debugfs.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
+#include <linux/idr.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/mm.h>
@@ -75,6 +77,11 @@ struct vfio_iommu {
 	bool			v2;
 	bool			dirty_page_tracking;
 	struct list_head	emulated_iommu_groups;
+
+#ifdef CONFIG_VFIO_DEBUGFS
+	struct dentry		*debugfs_dir;
+	int			id;
+#endif
 };
 
 struct vfio_domain {
@@ -2584,6 +2591,136 @@ detach_group_done:
 	mutex_unlock(&iommu->lock);
 }
 
+#ifdef CONFIG_VFIO_DEBUGFS
+static int vfio_iommu_iova_debug_show(struct seq_file *seq, void *data)
+{
+	struct vfio_iommu *iommu = seq->private;
+	struct vfio_iova *iova;
+
+	mutex_lock(&iommu->lock);
+	list_for_each_entry(iova, &iommu->iova_list, list) {
+		seq_printf(seq, "[ %llx - %llx ]\n", iova->start, iova->end);
+	}
+	mutex_unlock(&iommu->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(vfio_iommu_iova_debug);
+
+static int vfio_iommu_device_debug_show(struct seq_file *seq, void *data)
+{
+	struct vfio_iommu *iommu = seq->private;
+	struct vfio_device *vdev;
+
+	if (list_empty(&iommu->device_list)) {
+		seq_puts(seq, "empty\n");
+		return 0;
+	}
+
+	mutex_lock(&iommu->lock);
+	mutex_lock(&iommu->device_list_lock);
+
+	list_for_each_entry(vdev, &iommu->device_list, iommu_entry) {
+		seq_printf(seq, "%s\n", dev_name(vdev->dev));
+	}
+
+	mutex_unlock(&iommu->device_list_lock);
+	mutex_unlock(&iommu->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(vfio_iommu_device_debug);
+
+static int vfio_iommu_dma_debug_show(struct seq_file *seq, void *data)
+{
+	struct vfio_iommu *iommu = seq->private;
+	struct rb_node *n;
+
+	mutex_lock(&iommu->lock);
+	for (n = rb_first(&iommu->dma_list); n; n = rb_next(n)) {
+		struct vfio_dma *dma = rb_entry(n, struct vfio_dma, node);
+
+		seq_printf(seq, "[ %llx - %llx ] %c%c @%lx %smapped\n",
+			   dma->iova, dma->iova + dma->size,
+			   dma->prot & IOMMU_READ ? 'r' : '-',
+			   dma->prot & IOMMU_WRITE ? 'w' : '-',
+			   dma->vaddr, dma->iommu_mapped ? "" : "not ");
+	}
+	mutex_unlock(&iommu->lock);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(vfio_iommu_dma_debug);
+
+static DEFINE_IDA(iommu_ida);
+static struct dentry *iommu_debugfs_root;
+
+static int vfio_iommu_debugfs_init(struct vfio_iommu *iommu)
+{
+	char name[64];
+
+	iommu->id = ida_alloc_min(&iommu_ida, 1, GFP_KERNEL);
+	if (iommu->id < 0)
+		return iommu->id;
+
+	snprintf(name, sizeof(name), "iommu%d", iommu->id);
+
+	iommu->debugfs_dir = debugfs_create_dir(name, iommu_debugfs_root);
+	if (IS_ERR(iommu->debugfs_dir))
+		return PTR_ERR(iommu->debugfs_dir);
+
+	debugfs_create_file("iova", 0400, iommu->debugfs_dir, (void *)iommu,
+			    &vfio_iommu_iova_debug_fops);
+	debugfs_create_file("device", 0400, iommu->debugfs_dir, (void *)iommu,
+			    &vfio_iommu_device_debug_fops);
+	debugfs_create_file("dma", 0400, iommu->debugfs_dir, (void *)iommu,
+			    &vfio_iommu_dma_debug_fops);
+
+	debugfs_create_u32("dma_avail", 0400, iommu->debugfs_dir, &iommu->dma_avail);
+	debugfs_create_u32("vaddr_invalid_count", 0400, iommu->debugfs_dir,
+			   &iommu->vaddr_invalid_count);
+	debugfs_create_x64("pgsize_bitmap", 0400, iommu->debugfs_dir,
+			   &iommu->pgsize_bitmap);
+	debugfs_create_u64("non_pinned_groups", 0400, iommu->debugfs_dir,
+			   &iommu->num_non_pinned_groups);
+	debugfs_create_bool("v2", 0400, iommu->debugfs_dir, &iommu->v2);
+	debugfs_create_bool("dirty_page_tracking", 0400, iommu->debugfs_dir,
+			    &iommu->dirty_page_tracking);
+
+	return 0;
+}
+
+static void vfio_iommu_debugfs_exit(struct vfio_iommu *iommu)
+{
+	debugfs_remove_recursive(iommu->debugfs_dir);
+	ida_free(&iommu_ida, iommu->id);
+}
+
+static int vfio_iommu_debugfs_create_root(void)
+{
+	iommu_debugfs_root = debugfs_create_dir("iommu", vfio_debugfs_root);
+	if (IS_ERR(iommu_debugfs_root))
+		return PTR_ERR(iommu_debugfs_root);
+	return 0;
+}
+
+static void vfio_iommu_debugfs_remove_root(void)
+{
+	debugfs_remove_recursive(iommu_debugfs_root);
+	iommu_debugfs_root = NULL;
+}
+
+#else
+
+static int vfio_iommu_debugfs_init(struct vfio_iommu *iommu)
+{
+	return 0;
+}
+
+static void vfio_iommu_debugfs_exit(struct vfio_iommu *iommu)
+{
+}
+
+#endif
+
 static void *vfio_iommu_type1_open(unsigned long arg)
 {
 	struct vfio_iommu *iommu;
@@ -2614,6 +2751,8 @@ static void *vfio_iommu_type1_open(unsigned long arg)
 	iommu->pgsize_bitmap = PAGE_MASK;
 	INIT_LIST_HEAD(&iommu->emulated_iommu_groups);
 
+	vfio_iommu_debugfs_init(iommu);
+
 	return iommu;
 }
 
@@ -2636,6 +2775,8 @@ static void vfio_iommu_type1_release(void *iommu_data)
 	struct vfio_iommu *iommu = iommu_data;
 	struct vfio_domain *domain, *domain_tmp;
 	struct vfio_iommu_group *group, *next_group;
+
+	vfio_iommu_debugfs_exit(iommu);
 
 	list_for_each_entry_safe(group, next_group,
 			&iommu->emulated_iommu_groups, next) {
@@ -3221,11 +3362,13 @@ static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
 
 static int __init vfio_iommu_type1_init(void)
 {
+	vfio_iommu_debugfs_create_root();
 	return vfio_register_iommu_driver(&vfio_iommu_driver_ops_type1);
 }
 
 static void __exit vfio_iommu_type1_cleanup(void)
 {
+	vfio_iommu_debugfs_remove_root();
 	vfio_unregister_iommu_driver(&vfio_iommu_driver_ops_type1);
 }
 
