@@ -9,7 +9,8 @@
 #include <linux/vfio.h>
 #include "vfio.h"
 
-static struct dentry *vfio_debugfs_root;
+struct dentry *vfio_debugfs_root;
+EXPORT_SYMBOL_GPL(vfio_debugfs_root);
 
 static int vfio_device_state_read(struct seq_file *seq, void *data)
 {

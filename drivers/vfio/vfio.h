@@ -454,6 +454,7 @@ void vfio_debugfs_remove_root(void);
 
 void vfio_device_debugfs_init(struct vfio_device *vdev);
 void vfio_device_debugfs_exit(struct vfio_device *vdev);
+extern struct dentry *vfio_debugfs_root;
 #else
 static inline void vfio_debugfs_create_root(void) { }
 static inline void vfio_debugfs_remove_root(void) { }
