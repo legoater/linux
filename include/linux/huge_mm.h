@@ -362,7 +362,7 @@ unsigned long thp_get_unmapped_area(struct file *filp, unsigned long addr,
 		unsigned long len, unsigned long pgoff, unsigned long flags);
 unsigned long thp_get_unmapped_area_vmflags(struct file *filp, unsigned long addr,
 		unsigned long len, unsigned long pgoff, unsigned long flags,
-		vm_flags_t vm_flags);
+		unsigned long align, vm_flags_t vm_flags);
 
 enum split_type {
 	SPLIT_TYPE_UNIFORM,
@@ -602,7 +602,8 @@ static inline unsigned long thp_vma_allowable_orders(struct vm_area_struct *vma,
 static inline unsigned long
 thp_get_unmapped_area_vmflags(struct file *filp, unsigned long addr,
 			      unsigned long len, unsigned long pgoff,
-			      unsigned long flags, vm_flags_t vm_flags)
+			      unsigned long flags, unsigned long align,
+			      vm_flags_t vm_flags)
 {
 	return 0;
 }
