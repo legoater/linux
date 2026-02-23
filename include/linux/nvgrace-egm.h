@@ -9,6 +9,7 @@
 #include <linux/auxiliary_bus.h>
 
 #define NVGRACE_EGM_DEV_NAME "egm"
+#define EGM_OFFSET_SHIFT   40
 
 struct gpu_node {
 	struct list_head list;

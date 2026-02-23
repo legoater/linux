@@ -17,19 +17,58 @@ struct chardev {
 	struct cdev cdev;
 };
 
+static struct nvgrace_egm_dev *
+egm_chardev_to_nvgrace_egm_dev(struct chardev *egm_chardev)
+{
+	struct auxiliary_device *aux_dev =
+		container_of(egm_chardev->device.parent, struct auxiliary_device, dev);
+
+	return container_of(aux_dev, struct nvgrace_egm_dev, aux_dev);
+}
+
 static int nvgrace_egm_open(struct inode *inode, struct file *file)
 {
+	struct chardev *egm_chardev =
+		container_of(inode->i_cdev, struct chardev, cdev);
+
+	file->private_data = egm_chardev;
+
 	return 0;
 }
 
 static int nvgrace_egm_release(struct inode *inode, struct file *file)
 {
+	file->private_data = NULL;
+
 	return 0;
 }
 
 static int nvgrace_egm_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	return 0;
+	struct chardev *egm_chardev = file->private_data;
+	struct nvgrace_egm_dev *egm_dev =
+		egm_chardev_to_nvgrace_egm_dev(egm_chardev);
+	u64 req_len, pgoff, end;
+	unsigned long start_pfn;
+
+	pgoff = vma->vm_pgoff &
+		((1U << (EGM_OFFSET_SHIFT - PAGE_SHIFT)) - 1);
+
+	if (check_sub_overflow(vma->vm_end, vma->vm_start, &req_len) ||
+	    check_add_overflow(PHYS_PFN(egm_dev->egmphys), pgoff, &start_pfn) ||
+	    check_add_overflow(PFN_PHYS(pgoff), req_len, &end))
+		return -EOVERFLOW;
+
+	if (end > egm_dev->egmlength)
+		return -EINVAL;
+
+	/*
+	 * EGM memory is invisible to the host kernel and is not managed
+	 * by it. Map the usermode VMA to the EGM region.
+	 */
+	return remap_pfn_range(vma, vma->vm_start,
+			       start_pfn, req_len,
+			       vma->vm_page_prot);
 }
 
 static const struct file_operations file_ops = {
