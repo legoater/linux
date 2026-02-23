@@ -11,6 +11,29 @@
 static dev_t dev;
 static struct class *class;
 
+static int egm_driver_probe(struct auxiliary_device *aux_dev,
+			    const struct auxiliary_device_id *id)
+{
+	return 0;
+}
+
+static void egm_driver_remove(struct auxiliary_device *aux_dev)
+{
+}
+
+static const struct auxiliary_device_id egm_id_table[] = {
+	{ .name = "nvgrace_gpu_vfio_pci.egm" },
+	{ },
+};
+MODULE_DEVICE_TABLE(auxiliary, egm_id_table);
+
+static struct auxiliary_driver egm_driver = {
+	.name = KBUILD_MODNAME,
+	.id_table = egm_id_table,
+	.probe = egm_driver_probe,
+	.remove = egm_driver_remove,
+};
+
 static char *egm_devnode(const struct device *device, umode_t *mode)
 {
 	if (mode)
@@ -35,17 +58,26 @@ static int __init nvgrace_egm_init(void)
 
 	class = class_create(NVGRACE_EGM_DEV_NAME);
 	if (IS_ERR(class)) {
-		unregister_chrdev_region(dev, MAX_EGM_NODES);
-		return PTR_ERR(class);
+		ret = PTR_ERR(class);
+		goto unregister_chrdev;
 	}
 
 	class->devnode = egm_devnode;
 
-	return 0;
+	ret = auxiliary_driver_register(&egm_driver);
+	if (!ret)
+		goto fn_exit;
+
+	class_destroy(class);
+unregister_chrdev:
+	unregister_chrdev_region(dev, MAX_EGM_NODES);
+fn_exit:
+	return ret;
 }
 
 static void __exit nvgrace_egm_cleanup(void)
 {
+	auxiliary_driver_unregister(&egm_driver);
 	class_destroy(class);
 	unregister_chrdev_region(dev, MAX_EGM_NODES);
 }
