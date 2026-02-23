@@ -56,6 +56,50 @@ error_exit:
 	return ret;
 }
 
+static struct device *egm_find_chardev(struct nvgrace_egm_dev *egm_dev)
+{
+	char name[32] = { 0 };
+
+	scnprintf(name, sizeof(name), "egm%lld", egm_dev->egmpxm);
+	return device_find_child_by_name(&egm_dev->aux_dev.dev, name);
+}
+
+static int nvgrace_egm_create_gpu_links(struct nvgrace_egm_dev *egm_dev,
+					struct pci_dev *pdev)
+{
+	struct device *chardev_dev = egm_find_chardev(egm_dev);
+	int ret;
+
+	if (!chardev_dev)
+		return 0;
+
+	ret = sysfs_create_link(&chardev_dev->kobj,
+				&pdev->dev.kobj,
+				dev_name(&pdev->dev));
+
+	put_device(chardev_dev);
+
+	if (ret && ret != -EEXIST)
+		return ret;
+
+	return 0;
+}
+
+static void remove_egm_symlinks(struct nvgrace_egm_dev *egm_dev,
+				struct pci_dev *pdev)
+{
+	struct device *chardev_dev;
+
+	chardev_dev = egm_find_chardev(egm_dev);
+	if (!chardev_dev)
+		return;
+
+	sysfs_remove_link(&chardev_dev->kobj,
+			  dev_name(&pdev->dev));
+
+	put_device(chardev_dev);
+}
+
 int add_gpu(struct nvgrace_egm_dev *egm_dev, struct pci_dev *pdev)
 {
 	struct gpu_node *node;
@@ -68,7 +112,7 @@ int add_gpu(struct nvgrace_egm_dev *egm_dev, struct pci_dev *pdev)
 
 	list_add_tail(&node->list, &egm_dev->gpus);
 
-	return 0;
+	return nvgrace_egm_create_gpu_links(egm_dev, pdev);
 }
 
 void remove_gpu(struct nvgrace_egm_dev *egm_dev, struct pci_dev *pdev)
@@ -77,6 +121,7 @@ void remove_gpu(struct nvgrace_egm_dev *egm_dev, struct pci_dev *pdev)
 
 	list_for_each_entry_safe(node, tmp, &egm_dev->gpus, list) {
 		if (node->pdev == pdev) {
+			remove_egm_symlinks(egm_dev, pdev);
 			list_del(&node->list);
 			kfree(node);
 		}
