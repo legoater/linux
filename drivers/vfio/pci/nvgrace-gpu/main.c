@@ -10,6 +10,8 @@
 #include <linux/pci-p2pdma.h>
 #include <linux/pm_runtime.h>
 #include <linux/memory-failure.h>
+#include <linux/nvgrace-egm.h>
+#include "egm_dev.h"
 
 /*
  * The device memory usable to the workloads running in the VM is cached
@@ -65,6 +67,68 @@ struct nvgrace_gpu_pci_core_device {
 	/* GPU has just been reset */
 	bool reset_done;
 };
+
+/*
+ * Track egm device lists. Note that there is one device per socket.
+ * All the GPUs belonging to the same sockets are associated with
+ * the EGM device for that socket.
+ */
+static struct list_head egm_dev_list;
+
+static int nvgrace_gpu_create_egm_aux_device(struct pci_dev *pdev)
+{
+	struct nvgrace_egm_dev_entry *egm_entry;
+	u64 egmpxm;
+	int ret = 0;
+
+	/*
+	 * EGM is an optional feature enabled in SBIOS. If disabled, there
+	 * will be no EGM properties populated in the ACPI tables and this
+	 * fetch would fail. Treat this failure as non-fatal and return
+	 * early.
+	 */
+	if (nvgrace_gpu_has_egm_property(pdev, &egmpxm))
+		goto exit;
+
+	egm_entry = kzalloc(sizeof(*egm_entry), GFP_KERNEL);
+	if (!egm_entry)
+		return -ENOMEM;
+
+	egm_entry->egm_dev =
+		nvgrace_gpu_create_aux_device(pdev, NVGRACE_EGM_DEV_NAME,
+					      egmpxm);
+	if (!egm_entry->egm_dev) {
+		kvfree(egm_entry);
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	list_add_tail(&egm_entry->list, &egm_dev_list);
+
+exit:
+	return ret;
+}
+
+static void nvgrace_gpu_destroy_egm_aux_device(struct pci_dev *pdev)
+{
+	struct nvgrace_egm_dev_entry *egm_entry, *temp_egm_entry;
+	u64 egmpxm;
+
+	if (nvgrace_gpu_has_egm_property(pdev, &egmpxm))
+		return;
+
+	list_for_each_entry_safe(egm_entry, temp_egm_entry, &egm_dev_list, list) {
+		/*
+		 * Free the EGM region corresponding to the input GPU
+		 * device.
+		 */
+		if (egm_entry->egm_dev->egmpxm == egmpxm) {
+			auxiliary_device_destroy(&egm_entry->egm_dev->aux_dev);
+			list_del(&egm_entry->list);
+			kvfree(egm_entry);
+		}
+	}
+}
 
 static void nvgrace_gpu_init_fake_bar_emu_regs(struct vfio_device *core_vdev)
 {
@@ -1209,6 +1273,11 @@ static int nvgrace_gpu_probe(struct pci_dev *pdev,
 						    memphys, memlength);
 		if (ret)
 			goto out_put_vdev;
+
+		ret = nvgrace_gpu_create_egm_aux_device(pdev);
+		if (ret)
+			goto out_put_vdev;
+
 		nvdev->core_device.pci_ops = &nvgrace_gpu_pci_dev_ops;
 	} else {
 		nvdev->core_device.pci_ops = &nvgrace_gpu_pci_dev_core_ops;
@@ -1216,10 +1285,12 @@ static int nvgrace_gpu_probe(struct pci_dev *pdev,
 
 	ret = vfio_pci_core_register_device(&nvdev->core_device);
 	if (ret)
-		goto out_put_vdev;
+		goto out_reg;
 
 	return ret;
 
+out_reg:
+	nvgrace_gpu_destroy_egm_aux_device(pdev);
 out_put_vdev:
 	vfio_put_device(&nvdev->core_device.vdev);
 	return ret;
@@ -1229,6 +1300,7 @@ static void nvgrace_gpu_remove(struct pci_dev *pdev)
 {
 	struct vfio_pci_core_device *core_device = dev_get_drvdata(&pdev->dev);
 
+	nvgrace_gpu_destroy_egm_aux_device(pdev);
 	vfio_pci_core_unregister_device(core_device);
 	vfio_put_device(&core_device->vdev);
 }
@@ -1286,6 +1358,8 @@ static struct pci_driver nvgrace_gpu_vfio_pci_driver = {
 
 static int __init nvgrace_gpu_vfio_pci_init(void)
 {
+	INIT_LIST_HEAD(&egm_dev_list);
+
 	return pci_register_driver(&nvgrace_gpu_vfio_pci_driver);
 }
 module_init(nvgrace_gpu_vfio_pci_init);
