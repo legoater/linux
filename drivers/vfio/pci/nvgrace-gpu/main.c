@@ -77,9 +77,10 @@ static struct list_head egm_dev_list;
 
 static int nvgrace_gpu_create_egm_aux_device(struct pci_dev *pdev)
 {
-	struct nvgrace_egm_dev_entry *egm_entry;
+	struct nvgrace_egm_dev_entry *egm_entry = NULL;
 	u64 egmpxm;
 	int ret = 0;
+	bool is_new_region = false;
 
 	/*
 	 * EGM is an optional feature enabled in SBIOS. If disabled, there
@@ -90,6 +91,19 @@ static int nvgrace_gpu_create_egm_aux_device(struct pci_dev *pdev)
 	if (nvgrace_gpu_has_egm_property(pdev, &egmpxm))
 		goto exit;
 
+	list_for_each_entry(egm_entry, &egm_dev_list, list) {
+		/*
+		 * A system could have multiple GPUs associated with an
+		 * EGM region and will have the same set of EGM region
+		 * information. Skip the EGM region information fetch if
+		 * already done through a differnt GPU on the same socket.
+		 */
+		if (egm_entry->egm_dev->egmpxm == egmpxm)
+			goto add_gpu;
+	}
+
+	is_new_region = true;
+
 	egm_entry = kzalloc(sizeof(*egm_entry), GFP_KERNEL);
 	if (!egm_entry)
 		return -ENOMEM;
@@ -98,13 +112,24 @@ static int nvgrace_gpu_create_egm_aux_device(struct pci_dev *pdev)
 		nvgrace_gpu_create_aux_device(pdev, NVGRACE_EGM_DEV_NAME,
 					      egmpxm);
 	if (!egm_entry->egm_dev) {
-		kvfree(egm_entry);
 		ret = -EINVAL;
-		goto exit;
+		goto free_egm_entry;
 	}
 
-	list_add_tail(&egm_entry->list, &egm_dev_list);
+add_gpu:
+	ret = add_gpu(egm_entry->egm_dev, pdev);
+	if (ret)
+		goto free_dev;
 
+	if (is_new_region)
+		list_add_tail(&egm_entry->list, &egm_dev_list);
+	return 0;
+
+free_dev:
+	if (is_new_region)
+		auxiliary_device_destroy(&egm_entry->egm_dev->aux_dev);
+free_egm_entry:
+	kvfree(egm_entry);
 exit:
 	return ret;
 }
@@ -123,6 +148,10 @@ static void nvgrace_gpu_destroy_egm_aux_device(struct pci_dev *pdev)
 		 * device.
 		 */
 		if (egm_entry->egm_dev->egmpxm == egmpxm) {
+			remove_gpu(egm_entry->egm_dev, pdev);
+			if (!list_empty(&egm_entry->egm_dev->gpus))
+				break;
+
 			auxiliary_device_destroy(&egm_entry->egm_dev->aux_dev);
 			list_del(&egm_entry->list);
 			kvfree(egm_entry);
