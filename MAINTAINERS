@@ -20106,6 +20106,11 @@ L:	linux-acpi@vger.kernel.org
 S:	Maintained
 F:	drivers/acpi/apei/ghes-nvidia.c
 
+NVIDIA GRACE EGM PLATFORM DRIVER
+M:	Ankit Agrawal <ankita@nvidia.com>
+S:	Supported
+F:	drivers/platform/nvidia/
+
 NVIDIA VRS RTC DRIVER
 M:	Shubhi Garg <shgarg@nvidia.com>
 L:	linux-tegra@vger.kernel.org
