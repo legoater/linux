@@ -20110,6 +20110,7 @@ NVIDIA GRACE EGM PLATFORM DRIVER
 M:	Ankit Agrawal <ankita@nvidia.com>
 S:	Supported
 F:	drivers/platform/nvidia/
+F:	include/uapi/linux/egm.h
 
 NVIDIA VRS RTC DRIVER
 M:	Shubhi Garg <shgarg@nvidia.com>
