@@ -3,6 +3,7 @@
  * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved
  */
 
+#include <linux/memory-failure.h>
 #include <linux/mutex.h>
 #include <linux/sched/signal.h>
 #include <linux/sizes.h>
@@ -40,7 +41,7 @@ struct gpu_node {
 struct nvgrace_egm_dev {
 	struct device device;
 	struct cdev cdev;
-	/* serialises the first-open scrub */
+	/* serialises the first-open scrub + PFN registration */
 	struct mutex open_lock;
 	/* protected by open_lock */
 	unsigned int open_count;
@@ -49,6 +50,7 @@ struct nvgrace_egm_dev {
 	 * EGM region and keyed by page index.
 	 */
 	struct xarray retired_pages;
+	struct pfn_address_space pfn_address_space;
 	phys_addr_t egmphys;
 	size_t egmlength;
 	phys_addr_t retiredpagesphys;
@@ -71,6 +73,104 @@ static LIST_HEAD(egm_chardevs);
 static void cleanup_retired_pages(struct nvgrace_egm_dev *egm_dev);
 static int nvgrace_egm_fetch_retired_pages(struct nvgrace_egm_dev *egm_dev);
 
+static int pfn_memregion_offset(struct nvgrace_egm_dev *egm_dev,
+				unsigned long pfn,
+				pgoff_t *pfn_offset_in_region)
+{
+	unsigned long start_pfn, num_pages;
+
+	start_pfn = PHYS_PFN(egm_dev->egmphys);
+	num_pages = egm_dev->egmlength >> PAGE_SHIFT;
+
+	if (pfn < start_pfn || pfn >= start_pfn + num_pages)
+		return -EFAULT;
+
+	*pfn_offset_in_region = pfn - start_pfn;
+
+	return 0;
+}
+
+static int track_ecc_offset(struct nvgrace_egm_dev *egm_dev,
+			    unsigned long mem_offset)
+{
+	void *old;
+
+	/*
+	 * This runs from the pfn_to_vma_pgoff callback, which the
+	 * memory_failure path invokes under rcu_read_lock() (see
+	 * collect_procs_pfn()). Sleeping is not allowed in that atomic
+	 * context and so use GFP_ATOMIC rather than GFP_KERNEL.
+	 *
+	 * Storing by page index makes a repeated report at the same offset a
+	 * harmless overwrite, so no explicit de-duplication is needed.
+	 */
+	old = xa_store(&egm_dev->retired_pages, mem_offset >> PAGE_SHIFT,
+		       EGM_RETIRED_MARK, GFP_ATOMIC);
+	if (xa_is_err(old))
+		return xa_err(old);
+
+	return 0;
+}
+
+static int nvgrace_egm_pfn_to_vma_pgoff(struct vm_area_struct *vma,
+					unsigned long pfn,
+					pgoff_t *pgoff)
+{
+	struct nvgrace_egm_dev *egm_dev = vma->vm_file->private_data;
+	pgoff_t vma_offset_in_region = vma->vm_pgoff;
+	pgoff_t pfn_offset_in_region;
+	int ret;
+
+	ret = pfn_memregion_offset(egm_dev, pfn, &pfn_offset_in_region);
+	if (ret)
+		return ret;
+
+	/* Ensure PFN is not before VMA's start within the region */
+	if (pfn_offset_in_region < vma_offset_in_region)
+		return -EFAULT;
+
+	/* Ensure PFN is not past the VMA's end within the region */
+	if (pfn_offset_in_region >= vma_offset_in_region + vma_pages(vma))
+		return -EFAULT;
+
+	/*
+	 * The VMA's vm_pgoff is the page offset of its start within the EGM
+	 * region, so the region offset of the pfn is already the pgoff to
+	 * report.
+	 */
+	*pgoff = pfn_offset_in_region;
+
+	/*
+	 * Record the poisoned offset for reporting via
+	 * EGM_RETIRED_PAGES_LIST. This bookkeeping is best-effort: its
+	 * failure must not be reported as "vma does not map pfn", or the
+	 * owning process would not be signalled for the poisoned page.
+	 */
+	track_ecc_offset(egm_dev, *pgoff << PAGE_SHIFT);
+
+	return 0;
+}
+
+static int
+nvgrace_egm_register_pfn_range(struct inode *inode,
+			       struct nvgrace_egm_dev *egm_dev)
+{
+	unsigned long pfn, nr_pages;
+	int ret;
+
+	pfn = PHYS_PFN(egm_dev->egmphys);
+	nr_pages = egm_dev->egmlength >> PAGE_SHIFT;
+
+	egm_dev->pfn_address_space.node.start = pfn;
+	egm_dev->pfn_address_space.node.last = pfn + nr_pages - 1;
+	egm_dev->pfn_address_space.mapping = inode->i_mapping;
+	egm_dev->pfn_address_space.pfn_to_vma_pgoff = nvgrace_egm_pfn_to_vma_pgoff;
+
+	ret = register_pfn_address_space(&egm_dev->pfn_address_space);
+
+	return ret;
+}
+
 static int nvgrace_egm_open(struct inode *inode, struct file *file)
 {
 	struct nvgrace_egm_dev *egm_dev =
@@ -84,9 +184,9 @@ static int nvgrace_egm_open(struct inode *inode, struct file *file)
 
 	/*
 	 * The EGM region is a physical carveout handed to a single VM at a
-	 * time and must be scrubbed before each handover. Take open_lock
-	 * killably around the scrub which can run for long time, so that
-	 * the waiters stay killable.
+	 * time and must be scrubbed and registered with memory_failure before
+	 * each handover. Take open_lock killably around the scrub which can
+	 * run for long time, so that the waiters stay killable.
 	 */
 	if (mutex_lock_killable(&egm_dev->open_lock))
 		return -EINTR;
@@ -142,10 +242,15 @@ static int nvgrace_egm_open(struct inode *inode, struct file *file)
 		remaining -= chunk_size;
 	}
 
+	ret = nvgrace_egm_register_pfn_range(inode, egm_dev);
+	if (ret && ret != -EOPNOTSUPP)
+		goto unlock;
+
 	/*
-	 * Mark the device open only after the scrub completes so that a
-	 * concurrent opener cannot observe a non-zero count and proceed
-	 * before the region has been cleared.
+	 * Only mark the device open once the scrub and registration have
+	 * succeeded. On failure open_count stays 0, so this opener returns
+	 * an error (release() never runs for it) and the next opener
+	 * retries the scrub and registration from a clean state.
 	 */
 	egm_dev->open_count = 1;
 	ret = 0;
@@ -162,8 +267,10 @@ static int nvgrace_egm_release(struct inode *inode, struct file *file)
 
 	guard(mutex)(&egm_dev->open_lock);
 
-	if (!--egm_dev->open_count)
+	if (!--egm_dev->open_count) {
+		unregister_pfn_address_space(&egm_dev->pfn_address_space);
 		file->private_data = NULL;
+	}
 
 	return 0;
 }
