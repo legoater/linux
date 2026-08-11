@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config IGB_VFIO_PCI
+	tristate "VFIO PCI live migration support for Intel 82576 (igbvf) VF"
+	select VFIO_PCI_CORE
+	default n
+	help
+	  VFIO PCI variant driver for the Intel 82576 (igbvf) virtual
+	  function with live migration support (stop-copy and pre-copy).
+
+	  The driver communicates with the emulated PF through a DVSEC
+	  capability in VF extended config space to support migration.
+	  It is intended for nested virtualization with QEMU's igb
+	  device model.
+
+	  If you don't know what to do here, say N.
