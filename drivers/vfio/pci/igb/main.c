@@ -8,6 +8,7 @@
  */
 
 #include <linux/anon_inodes.h>
+#include <linux/compat.h>
 #include <linux/device.h>
 #include <linux/file.h>
 #include <linux/io.h>
@@ -55,6 +56,7 @@
 #define IGB_MIG_STATE_RUNNING		2
 #define IGB_MIG_STATE_STOP_COPY		3
 #define IGB_MIG_STATE_RESUMING		4
+#define IGB_MIG_STATE_PRE_COPY		5
 
 #define IGB_MIG_QUIESCE_TIMEOUT_MS	1000
 #define IGB_VF_STATE_MAX_SIZE		4096
@@ -394,9 +396,49 @@ out_unlock:
 	return done;
 }
 
+static long igb_precopy_ioctl(struct file *filp, unsigned int cmd,
+			      unsigned long arg)
+{
+	struct igb_migration_file *migf = filp->private_data;
+	struct igb_pci_core_device *igb_dev = migf->igb_dev;
+	struct vfio_precopy_info info = {};
+	loff_t *pos = &filp->f_pos;
+	int ret = 0;
+
+	ret = vfio_check_precopy_ioctl(&igb_dev->core_device.vdev, cmd, arg, &info);
+	if (ret)
+		return ret;
+
+	mutex_lock(&igb_dev->state_mutex);
+	if (igb_dev->mig_state != VFIO_DEVICE_STATE_PRE_COPY) {
+		mutex_unlock(&igb_dev->state_mutex);
+		return -EINVAL;
+	}
+
+	mutex_lock(&migf->lock);
+	if (migf->disabled) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (*pos > migf->size) {
+		ret = -EINVAL;
+		goto out;
+	}
+	info.initial_bytes = migf->size - *pos;
+out:
+	mutex_unlock(&migf->lock);
+	mutex_unlock(&igb_dev->state_mutex);
+	if (ret)
+		return ret;
+	return copy_to_user((void __user *)arg, &info,
+			    offsetofend(struct vfio_precopy_info, dirty_bytes)) ? -EFAULT : 0;
+}
+
 static const struct file_operations igb_save_fops = {
 	.owner = THIS_MODULE,
 	.read = igb_save_read,
+	.unlocked_ioctl = igb_precopy_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	.release = igb_release_file,
 };
 
@@ -663,6 +705,69 @@ igb_pci_step_device_state_locked(struct igb_pci_core_device *igb_dev,
 		return NULL;
 	}
 
+	if (cur == VFIO_DEVICE_STATE_RUNNING && new == VFIO_DEVICE_STATE_PRE_COPY) {
+		struct igb_migration_file *migf;
+
+		ret = igb_set_state(igb_dev, IGB_MIG_STATE_PRE_COPY);
+		if (ret)
+			return ERR_PTR(ret);
+		/*
+		 * Create an empty save file.  Full device state is deferred
+		 * to the PRE_COPY -> STOP_COPY transition since device
+		 * state is transient while the device is still running.
+		 */
+		migf = kzalloc_obj(*migf, GFP_KERNEL);
+		if (!migf)
+			return ERR_PTR(-ENOMEM);
+		migf->filp = anon_inode_getfile("igb_mig", &igb_save_fops, migf, O_RDONLY);
+		if (IS_ERR(migf->filp)) {
+			int err = PTR_ERR(migf->filp);
+
+			kfree(migf);
+			return ERR_PTR(err);
+		}
+		stream_open(migf->filp->f_inode, migf->filp);
+		mutex_init(&migf->lock);
+		migf->igb_dev = igb_dev;
+
+		get_file(migf->filp);
+		igb_dev->saving_migf = migf;
+		return migf->filp;
+	}
+
+	if (cur == VFIO_DEVICE_STATE_PRE_COPY && new == VFIO_DEVICE_STATE_STOP_COPY) {
+		struct igb_migration_file *migf = igb_dev->saving_migf;
+
+		if (!migf)
+			return ERR_PTR(-EINVAL);
+
+		ret = igb_set_state(igb_dev, IGB_MIG_STATE_STOP_COPY);
+		if (ret)
+			return ERR_PTR(ret);
+
+		ret = igb_wait_quiesced(igb_dev);
+		if (ret)
+			return ERR_PTR(ret);
+
+		/*
+		 * Now that the device is quiesced, snapshot the full state
+		 * into the existing save file.  Userspace reads from the
+		 * same data_fd it got during PRE_COPY.
+		 */
+		ret = igb_populate_save_file(igb_dev, migf);
+		if (ret)
+			return ERR_PTR(ret);
+		return NULL;
+	}
+
+	if (cur == VFIO_DEVICE_STATE_PRE_COPY && new == VFIO_DEVICE_STATE_RUNNING) {
+		igb_disable_fds(igb_dev);
+		ret = igb_set_state(igb_dev, IGB_MIG_STATE_RUNNING);
+		if (ret)
+			return ERR_PTR(ret);
+		return NULL;
+	}
+
 	WARN_ON(true);
 	return ERR_PTR(-EINVAL);
 }
@@ -809,7 +914,7 @@ static int igb_vfio_pci_init_dev(struct vfio_device *core_vdev)
 
 	mutex_init(&igb_dev->state_mutex);
 
-	core_vdev->migration_flags = VFIO_MIGRATION_STOP_COPY;
+	core_vdev->migration_flags = VFIO_MIGRATION_STOP_COPY | VFIO_MIGRATION_PRE_COPY;
 	core_vdev->mig_ops = &igb_pci_mig_ops;
 	return vfio_pci_core_init_dev(core_vdev);
 }
