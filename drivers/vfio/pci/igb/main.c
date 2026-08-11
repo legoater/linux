@@ -12,6 +12,7 @@
 #include <linux/device.h>
 #include <linux/file.h>
 #include <linux/io.h>
+#include <linux/interval_tree.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -38,11 +39,18 @@
 
 /* CAPS register layout */
 #define IGB_MIG_CAP_F_STATE		BIT(0)
+#define IGB_MIG_CAP_F_DIRTY		BIT(1)
+#define IGB_MIG_CAPS_MAX_RANGES_SHIFT	8
+#define IGB_MIG_CAPS_MAX_RANGES_MASK	(0xfu << 8)
+#define IGB_MIG_CAPS_PGSIZE_MASK	(0x1fu << 12)
 
 /* CTRL register: cmd in [7:0], arg in [31:8] */
 #define IGB_MIG_CMD_SET_STATE		1
 #define IGB_MIG_CMD_SAVE		2
 #define IGB_MIG_CMD_LOAD		3
+#define IGB_MIG_CMD_DIRTY_ENABLE	4
+#define IGB_MIG_CMD_DIRTY_DISABLE	5
+#define IGB_MIG_CMD_DIRTY_QUERY		6
 
 /* STATUS register: state [7:0], error_code [15:8], quiesced [16] */
 #define IGB_MIG_STATUS_STATE_MASK	0xff
@@ -58,8 +66,37 @@
 #define IGB_MIG_STATE_RESUMING		4
 #define IGB_MIG_STATE_PRE_COPY		5
 
+#define IGB_MIG_DIRTY_DEFAULT_PGSIZE	4096
 #define IGB_MIG_QUIESCE_TIMEOUT_MS	1000
 #define IGB_VF_STATE_MAX_SIZE		4096
+
+/* DMA buffer for DIRTY_ENABLE command */
+struct igb_mig_dirty_enable_req {
+	__le32 len;
+	__le32 flags;
+	__le64 pgsize;
+	__le64 range_iova;
+	__le64 range_size;
+	__le32 reserved[4];
+};
+
+/* DMA buffer for DIRTY_QUERY command */
+struct igb_mig_dirty_query {
+	__le32 len;
+	__le32 flags;
+	__le64 iova;
+	__le64 size;
+	__le32 bitmap_size;
+	__le32 dirty_page_count;
+	__le64 dma_writes;
+	__le32 reserved[6];
+	u8 bitmap[];
+};
+
+struct igb_pci_dirty_range {
+	u64 iova;
+	u64 size;
+};
 
 struct igb_migration_file {
 	struct file *filp;
@@ -75,6 +112,7 @@ struct igb_pci_core_device {
 	struct vfio_pci_core_device core_device;
 	struct pci_dev *pdev;
 
+	u8 dirty_tracking:1;
 	int dvsec_pos;
 	int dvsec_len;
 	u32 state_max_size;
@@ -83,6 +121,13 @@ struct igb_pci_core_device {
 	enum vfio_device_mig_state mig_state;
 	struct igb_migration_file *resuming_migf;
 	struct igb_migration_file *saving_migf;
+	struct igb_mig_dirty_query *dirty_query;
+	size_t dirty_query_size;
+	struct igb_pci_dirty_range *dirty_ranges;
+	u8 max_dirty_ranges;
+	u32 supported_pgsizes;
+	u8 num_dirty_ranges;
+	u64 dirty_page_size;
 };
 
 static struct pci_dev *igb_to_pci_dev(struct igb_pci_core_device *igb_dev)
@@ -332,6 +377,30 @@ static int igb_discover_dvsec(struct igb_pci_core_device *igb_dev)
 
 	dev_info(&pdev->dev, "migration DVSEC at 0x%x: caps=0x%x data_size=%u\n",
 		 igb_dev->dvsec_pos, caps, igb_dev->state_max_size);
+
+	if (!(caps & IGB_MIG_CAP_F_DIRTY))
+		return 0;
+
+	igb_dev->max_dirty_ranges = (caps & IGB_MIG_CAPS_MAX_RANGES_MASK)
+				     >> IGB_MIG_CAPS_MAX_RANGES_SHIFT;
+	igb_dev->supported_pgsizes = caps & IGB_MIG_CAPS_PGSIZE_MASK;
+
+	if (!igb_dev->max_dirty_ranges || !igb_dev->supported_pgsizes) {
+		dev_warn(&pdev->dev,
+			 "F_DIRTY set but max_ranges=%u pgsizes=0x%x, dirty tracking disabled\n",
+			 igb_dev->max_dirty_ranges, igb_dev->supported_pgsizes);
+		igb_dev->max_dirty_ranges = 0;
+		return 0;
+	}
+
+	igb_dev->dirty_ranges = kzalloc_objs(*igb_dev->dirty_ranges,
+					     igb_dev->max_dirty_ranges,
+					     GFP_KERNEL);
+	if (!igb_dev->dirty_ranges)
+		return -ENOMEM;
+
+	dev_dbg(&pdev->dev, "dirty caps: max_ranges=%u pgsizes=0x%x\n",
+		igb_dev->max_dirty_ranges, igb_dev->supported_pgsizes);
 
 	return 0;
 }
@@ -857,10 +926,13 @@ static int igb_pci_open_device(struct vfio_device *core_vdev)
 	return 0;
 }
 
+static int igb_pci_dirty_disable(struct igb_pci_core_device *igb_dev);
+
 static void igb_close_migratable(struct igb_pci_core_device *igb_dev)
 {
 	mutex_lock(&igb_dev->state_mutex);
 	igb_disable_fds(igb_dev);
+	igb_pci_dirty_disable(igb_dev);
 	mutex_unlock(&igb_dev->state_mutex);
 }
 
@@ -878,9 +950,242 @@ static void igb_vfio_pci_release_dev(struct vfio_device *core_vdev)
 	struct igb_pci_core_device *igb_dev =
 		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
 
+	kfree(igb_dev->dirty_ranges);
 	mutex_destroy(&igb_dev->state_mutex);
 	vfio_pci_core_release_dev(core_vdev);
 }
+
+static int igb_pci_dirty_enable(struct igb_pci_core_device *igb_dev,
+				struct rb_root_cached *ranges, u32 nnodes,
+				u64 *page_size)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+	struct interval_tree_node *node;
+	u32 num_ranges = nnodes;
+	u64 max_range_size = 0;
+	size_t alloc_size;
+	int i, ret;
+
+	if (igb_dev->dirty_tracking)
+		return -EBUSY;
+
+	if (!igb_dev->max_dirty_ranges)
+		return -EOPNOTSUPP;
+
+	if (num_ranges > igb_dev->max_dirty_ranges) {
+		vfio_combine_iova_ranges(ranges, nnodes,
+					 igb_dev->max_dirty_ranges);
+		num_ranges = igb_dev->max_dirty_ranges;
+	}
+
+	/* Only 4K is supported today; negotiate when more sizes are added */
+	*page_size = max_t(u64, *page_size, IGB_MIG_DIRTY_DEFAULT_PGSIZE);
+
+	/*
+	 * supported_pgsizes keeps the raw CAPS pgsize bits [16:12]
+	 * which match page size values directly: bit 12 = 4K, bit 16
+	 * = 64K, etc.
+	 */
+	if (!(igb_dev->supported_pgsizes & *page_size))
+		return -EINVAL;
+	igb_dev->dirty_page_size = *page_size;
+
+	node = interval_tree_iter_first(ranges, 0, ULONG_MAX);
+	for (i = 0; i < num_ranges && node; i++) {
+		struct igb_mig_dirty_enable_req *req;
+		u64 start = node->start;
+		u64 size = node->last - node->start + 1;
+
+		igb_dev->dirty_ranges[i].iova = start;
+		igb_dev->dirty_ranges[i].size = size;
+
+		if (size > max_range_size)
+			max_range_size = size;
+
+		req = kzalloc_obj(*req, GFP_KERNEL);
+		if (!req) {
+			ret = -ENOMEM;
+			goto err_disable;
+		}
+
+		req->len = cpu_to_le32(sizeof(*req));
+		req->flags = 0;
+		req->pgsize = cpu_to_le64(*page_size);
+		req->range_iova = cpu_to_le64(start);
+		req->range_size = cpu_to_le64(size);
+
+		igb_dvsec_set_buf_addr(igb_dev, virt_to_phys(req));
+		ret = igb_dvsec_send_cmd(igb_dev, IGB_MIG_CMD_DIRTY_ENABLE);
+
+		kfree(req);
+
+		if (ret)
+			goto err_disable;
+
+		dev_dbg(&pdev->dev,
+			"dirty range[%d]: iova=0x%llx size=0x%llx pgsize=%llu\n",
+			i, start, size, (unsigned long long)*page_size);
+
+		node = interval_tree_iter_next(node, 0, ULONG_MAX);
+	}
+	igb_dev->num_dirty_ranges = num_ranges;
+
+	/*
+	 * Allocate the bounce buffer for dirty queries.  Sized to hold
+	 * the header plus a bitmap covering the largest range.
+	 */
+	alloc_size = sizeof(*igb_dev->dirty_query) +
+		     DIV_ROUND_UP(max_range_size / *page_size, BITS_PER_BYTE);
+	igb_dev->dirty_query = kzalloc(alloc_size, GFP_KERNEL);
+	if (!igb_dev->dirty_query) {
+		ret = -ENOMEM;
+		goto err_disable;
+	}
+	igb_dev->dirty_query_size = alloc_size;
+
+	igb_dev->dirty_tracking = true;
+	dev_dbg(&pdev->dev, "start dirty page tracking\n");
+	return 0;
+
+err_disable:
+	igb_dvsec_send_cmd(igb_dev, IGB_MIG_CMD_DIRTY_DISABLE);
+	igb_dev->num_dirty_ranges = 0;
+	return ret;
+}
+
+static int igb_pci_dirty_disable(struct igb_pci_core_device *igb_dev)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+
+	if (!igb_dev->dirty_tracking)
+		return 0;
+
+	igb_dvsec_send_cmd(igb_dev, IGB_MIG_CMD_DIRTY_DISABLE);
+
+	kfree(igb_dev->dirty_query);
+	igb_dev->dirty_query = NULL;
+	igb_dev->dirty_query_size = 0;
+
+	igb_dev->num_dirty_ranges = 0;
+	igb_dev->dirty_tracking = false;
+	dev_dbg(&pdev->dev, "stop dirty page tracking\n");
+	return 0;
+}
+
+static bool igb_pci_dirty_range_valid(struct igb_pci_core_device *igb_dev,
+				      unsigned long iova, unsigned long length)
+{
+	int i;
+
+	for (i = 0; i < igb_dev->num_dirty_ranges; i++) {
+		struct igb_pci_dirty_range *r = &igb_dev->dirty_ranges[i];
+
+		if (iova >= r->iova && iova + length <= r->iova + r->size)
+			return true;
+	}
+	return false;
+}
+
+static int igb_pci_dirty_sync(struct igb_pci_core_device *igb_dev,
+			      struct iova_bitmap *dirty_bitmap,
+			      unsigned long iova, unsigned long length)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+	u64 pgsize = igb_dev->dirty_page_size;
+	struct igb_mig_dirty_query *query = igb_dev->dirty_query;
+	unsigned long nbits;
+	u32 bmp_bytes;
+	u32 dirty_pages = 0, i;
+	int ret;
+
+	if (!igb_dev->dirty_tracking)
+		return -EINVAL;
+
+	if (!igb_pci_dirty_range_valid(igb_dev, iova, length)) {
+		dev_err(&pdev->dev,
+			"dirty sync outside tracked range: iova=0x%lx length=0x%lx\n",
+			iova, length);
+		return -EINVAL;
+	}
+
+	dev_dbg(&pdev->dev, "dirty_sync iova=0x%lx length=0x%lx\n", iova, length);
+
+	nbits = length / pgsize;
+	bmp_bytes = DIV_ROUND_UP(nbits, BITS_PER_BYTE);
+
+	query->len = cpu_to_le32(sizeof(*query) + bmp_bytes);
+	query->flags = 0;
+	query->iova = cpu_to_le64(iova);
+	query->size = cpu_to_le64(length);
+	memset(query->bitmap, 0, bmp_bytes);
+
+	igb_dvsec_set_buf_addr(igb_dev, virt_to_phys(igb_dev->dirty_query));
+	ret = igb_dvsec_send_cmd(igb_dev, IGB_MIG_CMD_DIRTY_QUERY);
+	if (ret)
+		return ret;
+
+	for_each_set_bit(i, (unsigned long *)query->bitmap, nbits) {
+		unsigned long dirty_iova = iova + (unsigned long)i * pgsize;
+
+		dirty_pages++;
+		iova_bitmap_set(dirty_bitmap, dirty_iova, pgsize);
+	}
+
+	dev_dbg(&pdev->dev,
+		"dirty sync iova=%lx size=%lu dirty_pages=%u/%u dma_writes=%llu\n",
+		iova, length, dirty_pages,
+		le32_to_cpu(query->dirty_page_count),
+		le64_to_cpu(query->dma_writes));
+
+	return 0;
+}
+
+static int igb_pci_dma_log_read_and_clear(struct vfio_device *core_vdev,
+					  unsigned long iova,
+					  unsigned long length,
+					  struct iova_bitmap *dirty)
+{
+	struct igb_pci_core_device *igb_dev =
+		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
+	int ret;
+
+	mutex_lock(&igb_dev->state_mutex);
+	ret = igb_pci_dirty_sync(igb_dev, dirty, iova, length);
+	mutex_unlock(&igb_dev->state_mutex);
+	return ret;
+}
+
+static int igb_pci_dma_log_start(struct vfio_device *core_vdev,
+				 struct rb_root_cached *ranges, u32 nnodes,
+				 u64 *page_size)
+{
+	struct igb_pci_core_device *igb_dev =
+		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
+	int ret;
+
+	mutex_lock(&igb_dev->state_mutex);
+	ret = igb_pci_dirty_enable(igb_dev, ranges, nnodes, page_size);
+	mutex_unlock(&igb_dev->state_mutex);
+	return ret;
+}
+
+static int igb_pci_dma_log_stop(struct vfio_device *core_vdev)
+{
+	struct igb_pci_core_device *igb_dev =
+		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
+	int ret;
+
+	mutex_lock(&igb_dev->state_mutex);
+	ret = igb_pci_dirty_disable(igb_dev);
+	mutex_unlock(&igb_dev->state_mutex);
+	return ret;
+}
+
+static const struct vfio_log_ops igb_pci_log_ops = {
+	.log_start = igb_pci_dma_log_start,
+	.log_stop = igb_pci_dma_log_stop,
+	.log_read_and_clear = igb_pci_dma_log_read_and_clear,
+};
 
 static int igb_vfio_pci_init_dev(struct vfio_device *core_vdev)
 {
@@ -916,6 +1221,7 @@ static int igb_vfio_pci_init_dev(struct vfio_device *core_vdev)
 
 	core_vdev->migration_flags = VFIO_MIGRATION_STOP_COPY | VFIO_MIGRATION_PRE_COPY;
 	core_vdev->mig_ops = &igb_pci_mig_ops;
+	core_vdev->log_ops = &igb_pci_log_ops;
 	return vfio_pci_core_init_dev(core_vdev);
 }
 
@@ -990,6 +1296,7 @@ static struct pci_driver igb_vfio_pci_driver = {
 
 module_pci_driver(igb_vfio_pci_driver);
 
+MODULE_IMPORT_NS("IOMMUFD");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Cédric Le Goater <clg@redhat.com>");
 MODULE_DESCRIPTION("VFIO PCI - Intel 82576 Virtual Function");
