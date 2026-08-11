@@ -7,10 +7,15 @@
  * Author: Cédric Le Goater <clg@redhat.com>
  */
 
+#include <linux/anon_inodes.h>
 #include <linux/device.h>
+#include <linux/file.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/uaccess.h>
 #include <linux/vfio.h>
 #include <linux/vfio_pci_core.h>
 
@@ -26,6 +31,8 @@
 #define IGB_MIG_CAPS			0x0C
 #define IGB_MIG_CTRL			0x10
 #define IGB_MIG_STATUS			0x14
+#define IGB_MIG_BUF_ADDR_LO		0x18
+#define IGB_MIG_BUF_ADDR_HI		0x1C
 #define IGB_MIG_DATA_SIZE		0x20
 
 /* CAPS register layout */
@@ -33,17 +40,34 @@
 
 /* CTRL register: cmd in [7:0], arg in [31:8] */
 #define IGB_MIG_CMD_SET_STATE		1
+#define IGB_MIG_CMD_SAVE		2
+#define IGB_MIG_CMD_LOAD		3
 
 /* STATUS register: state [7:0], error_code [15:8], quiesced [16] */
 #define IGB_MIG_STATUS_STATE_MASK	0xff
 #define IGB_MIG_STATUS_ERROR_CODE_SHIFT	8
 #define IGB_MIG_STATUS_ERR_CODE(s)	(((s) >> IGB_MIG_STATUS_ERROR_CODE_SHIFT) & 0xff)
+#define IGB_MIG_STATUS_QUIESCED		BIT(16)
 
 /* Device state values */
 #define IGB_MIG_STATE_ERROR		0
 #define IGB_MIG_STATE_STOP		1
 #define IGB_MIG_STATE_RUNNING		2
+#define IGB_MIG_STATE_STOP_COPY		3
+#define IGB_MIG_STATE_RESUMING		4
+
+#define IGB_MIG_QUIESCE_TIMEOUT_MS	1000
 #define IGB_VF_STATE_MAX_SIZE		4096
+
+struct igb_migration_file {
+	struct file *filp;
+	/* Protects migration file data and state */
+	struct mutex lock;
+	bool disabled;
+	u8 *mig_data;
+	size_t size;
+	struct igb_pci_core_device *igb_dev;
+};
 
 struct igb_pci_core_device {
 	struct vfio_pci_core_device core_device;
@@ -55,11 +79,23 @@ struct igb_pci_core_device {
 	/* protect migration state */
 	struct mutex state_mutex;
 	enum vfio_device_mig_state mig_state;
+	struct igb_migration_file *resuming_migf;
+	struct igb_migration_file *saving_migf;
 };
 
 static struct pci_dev *igb_to_pci_dev(struct igb_pci_core_device *igb_dev)
 {
 	return igb_dev->pdev;
+}
+
+static void igb_dvsec_set_buf_addr(struct igb_pci_core_device *igb_dev, phys_addr_t addr)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+
+	pci_write_config_dword(pdev, igb_dev->dvsec_pos + IGB_MIG_BUF_ADDR_LO,
+			       lower_32_bits(addr));
+	pci_write_config_dword(pdev, igb_dev->dvsec_pos + IGB_MIG_BUF_ADDR_HI,
+			       upper_32_bits(addr));
 }
 
 static int igb_dvsec_read(struct igb_pci_core_device *igb_dev, int pos, u32 *val)
@@ -110,10 +146,95 @@ static int igb_dvsec_send_cmd(struct igb_pci_core_device *igb_dev, u32 cmd)
 	return 0;
 }
 
+static u32 igb_dvsec_read_status(struct igb_pci_core_device *igb_dev)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+	u32 status;
+
+	pci_read_config_dword(pdev, igb_dev->dvsec_pos + IGB_MIG_STATUS, &status);
+	return status;
+}
+
+static int igb_wait_quiesced(struct igb_pci_core_device *igb_dev)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+	u32 status;
+	int ret;
+
+	ret = read_poll_timeout(igb_dvsec_read_status, status,
+				!PCI_POSSIBLE_ERROR(status) &&
+				(status & IGB_MIG_STATUS_QUIESCED),
+				100, IGB_MIG_QUIESCE_TIMEOUT_MS * 1000,
+				false, igb_dev);
+	if (ret || PCI_POSSIBLE_ERROR(status)) {
+		dev_err(&pdev->dev,
+			"device not quiesced (status 0x%x)\n", status);
+		return ret ?: -EIO;
+	}
+	return 0;
+}
+
 static int igb_set_state(struct igb_pci_core_device *igb_dev, u32 state)
 {
 	return igb_dvsec_send_cmd(igb_dev,
 			      IGB_MIG_CMD_SET_STATE | (state << 8));
+}
+
+static int igb_load_data(struct igb_pci_core_device *igb_dev,
+			 struct igb_migration_file *migf)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+	void *dma_buf;
+	int ret;
+
+	if (!migf->size)
+		return 0;
+
+	if (migf->size > igb_dev->state_max_size) {
+		dev_err(&pdev->dev, "state too large (%zu)\n", migf->size);
+		return -ENOSPC;
+	}
+
+	dma_buf = kzalloc(migf->size, GFP_KERNEL);
+	if (!dma_buf)
+		return -ENOMEM;
+
+	memcpy(dma_buf, migf->mig_data, migf->size);
+
+	igb_dvsec_set_buf_addr(igb_dev, virt_to_phys(dma_buf));
+	ret = igb_dvsec_send_cmd(igb_dev,
+			     IGB_MIG_CMD_LOAD | ((u32)migf->size << 8));
+
+	kfree(dma_buf);
+
+	if (!ret)
+		dev_dbg(&pdev->dev, "loaded state: %zu bytes\n", migf->size);
+	return ret;
+}
+
+static int igb_save_data(struct igb_pci_core_device *igb_dev,
+			 void *buffer, size_t buffer_len)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+	void *dma_buf;
+	int ret;
+
+	dma_buf = kzalloc(buffer_len, GFP_KERNEL);
+	if (!dma_buf)
+		return -ENOMEM;
+
+	igb_dvsec_set_buf_addr(igb_dev, virt_to_phys(dma_buf));
+	ret = igb_dvsec_send_cmd(igb_dev, IGB_MIG_CMD_SAVE);
+
+	if (ret) {
+		kfree(dma_buf);
+		return ret;
+	}
+
+	memcpy(buffer, dma_buf, buffer_len);
+	kfree(dma_buf);
+	dev_dbg(&pdev->dev, "saved state: %zu bytes\n", buffer_len);
+	return 0;
 }
 
 static struct igb_pci_core_device *igb_drvdata(struct pci_dev *pdev)
@@ -213,6 +334,235 @@ static int igb_discover_dvsec(struct igb_pci_core_device *igb_dev)
 	return 0;
 }
 
+static void igb_disable_fd(struct igb_migration_file *migf)
+{
+	mutex_lock(&migf->lock);
+
+	/* release the device states buffer */
+	kvfree(migf->mig_data);
+	migf->mig_data = NULL;
+	migf->disabled = true;
+	migf->size = 0;
+	migf->filp->f_pos = 0;
+	mutex_unlock(&migf->lock);
+}
+
+static int igb_release_file(struct inode *inode, struct file *filp)
+{
+	struct igb_migration_file *migf = filp->private_data;
+
+	igb_disable_fd(migf);
+	mutex_destroy(&migf->lock);
+	kfree(migf);
+	return 0;
+}
+
+static ssize_t igb_save_read(struct file *filp, char __user *buf, size_t len, loff_t *pos)
+{
+	struct igb_migration_file *migf = filp->private_data;
+	ssize_t done = 0;
+	int ret;
+
+	if (pos)
+		return -ESPIPE;
+	pos = &filp->f_pos;
+
+	mutex_lock(&migf->lock);
+	if (*pos > migf->size) {
+		done = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (migf->disabled) {
+		done = -ENODEV;
+		goto out_unlock;
+	}
+
+	len = min_t(size_t, migf->size - *pos, len);
+	if (len) {
+		ret = copy_to_user(buf, migf->mig_data + *pos, len);
+		if (ret) {
+			done = -EFAULT;
+			goto out_unlock;
+		}
+		*pos += len;
+		done = len;
+	}
+
+out_unlock:
+	mutex_unlock(&migf->lock);
+	return done;
+}
+
+static const struct file_operations igb_save_fops = {
+	.owner = THIS_MODULE,
+	.read = igb_save_read,
+	.release = igb_release_file,
+};
+
+static ssize_t igb_resume_write(struct file *filp, const char __user *buf,
+				size_t len, loff_t *pos)
+{
+	struct igb_migration_file *migf = filp->private_data;
+	loff_t requested_length;
+	ssize_t done = 0;
+	int ret;
+
+	if (pos)
+		return -ESPIPE;
+	pos = &filp->f_pos;
+
+	if (*pos < 0 || check_add_overflow((loff_t)len, *pos, &requested_length))
+		return -EINVAL;
+
+	if (requested_length > migf->igb_dev->state_max_size)
+		return -EFBIG;
+	mutex_lock(&migf->lock);
+	if (migf->disabled) {
+		done = -ENODEV;
+		goto out_unlock;
+	}
+
+	ret = copy_from_user(migf->mig_data + *pos, buf, len);
+	if (ret) {
+		done = -EFAULT;
+		goto out_unlock;
+	}
+	*pos += len;
+	done = len;
+	migf->size += len;
+
+out_unlock:
+	mutex_unlock(&migf->lock);
+	return done;
+}
+
+static const struct file_operations igb_resume_fops = {
+	.owner = THIS_MODULE,
+	.write = igb_resume_write,
+	.release = igb_release_file,
+};
+
+static void igb_disable_fds(struct igb_pci_core_device *igb_dev)
+{
+	if (igb_dev->resuming_migf) {
+		igb_disable_fd(igb_dev->resuming_migf);
+		fput(igb_dev->resuming_migf->filp);
+		igb_dev->resuming_migf = NULL;
+	}
+
+	if (igb_dev->saving_migf) {
+		igb_disable_fd(igb_dev->saving_migf);
+		fput(igb_dev->saving_migf->filp);
+		igb_dev->saving_migf = NULL;
+	}
+}
+
+static struct igb_migration_file *
+igb_pci_resume_device_data(struct igb_pci_core_device *igb_dev)
+{
+	struct igb_migration_file *migf;
+	int ret;
+
+	migf = kzalloc_obj(*migf, GFP_KERNEL);
+	if (!migf)
+		return ERR_PTR(-ENOMEM);
+
+	migf->filp = anon_inode_getfile("igb_mig", &igb_resume_fops, migf, O_WRONLY);
+	if (IS_ERR(migf->filp)) {
+		int err = PTR_ERR(migf->filp);
+
+		kfree(migf);
+		return ERR_PTR(err);
+	}
+	stream_open(migf->filp->f_inode, migf->filp);
+	mutex_init(&migf->lock);
+	migf->igb_dev = igb_dev;
+
+	migf->mig_data = kvzalloc(igb_dev->state_max_size, GFP_KERNEL);
+	if (!migf->mig_data) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+
+	return migf;
+
+out_free:
+	fput(migf->filp);
+	return ERR_PTR(ret);
+}
+
+static int igb_populate_save_file(struct igb_pci_core_device *igb_dev,
+				  struct igb_migration_file *migf)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+	u32 data_size;
+	int ret;
+
+	ret = igb_dvsec_read(igb_dev, IGB_MIG_DATA_SIZE, &data_size);
+	if (ret)
+		return ret;
+
+	if (!data_size || data_size > igb_dev->state_max_size) {
+		dev_err(&pdev->dev, "bad DATA_SIZE %u after STOP_COPY\n", data_size);
+		return -EINVAL;
+	}
+
+	mutex_lock(&migf->lock);
+
+	migf->mig_data = kvzalloc(data_size, GFP_KERNEL);
+	if (!migf->mig_data) {
+		mutex_unlock(&migf->lock);
+		return -ENOMEM;
+	}
+
+	ret = igb_save_data(igb_dev, migf->mig_data, data_size);
+	if (ret) {
+		kvfree(migf->mig_data);
+		migf->mig_data = NULL;
+		mutex_unlock(&migf->lock);
+		return ret;
+	}
+
+	migf->size = data_size;
+	migf->filp->f_pos = 0;
+	mutex_unlock(&migf->lock);
+
+	dev_dbg(&pdev->dev, "populated save file: %zu bytes\n", migf->size);
+	return 0;
+}
+
+static struct igb_migration_file *
+igb_pci_save_device_data(struct igb_pci_core_device *igb_dev)
+{
+	struct igb_migration_file *migf;
+	int ret;
+
+	migf = kzalloc_obj(*migf, GFP_KERNEL);
+	if (!migf)
+		return ERR_PTR(-ENOMEM);
+
+	migf->filp = anon_inode_getfile("igb_mig", &igb_save_fops, migf, O_RDONLY);
+	if (IS_ERR(migf->filp)) {
+		int err = PTR_ERR(migf->filp);
+
+		kfree(migf);
+		return ERR_PTR(err);
+	}
+
+	stream_open(migf->filp->f_inode, migf->filp);
+	mutex_init(&migf->lock);
+	migf->igb_dev = igb_dev;
+
+	ret = igb_populate_save_file(igb_dev, migf);
+	if (ret) {
+		fput(migf->filp);
+		return ERR_PTR(ret);
+	}
+
+	return migf;
+}
+
 static const char *vfio_device_mig_state_str(enum vfio_device_mig_state state)
 {
 	switch (state) {
@@ -255,6 +605,57 @@ igb_pci_step_device_state_locked(struct igb_pci_core_device *igb_dev,
 		return NULL;
 	}
 
+	if (cur == VFIO_DEVICE_STATE_STOP && new == VFIO_DEVICE_STATE_STOP_COPY) {
+		struct igb_migration_file *migf;
+
+		ret = igb_wait_quiesced(igb_dev);
+		if (ret)
+			return ERR_PTR(ret);
+
+		ret = igb_set_state(igb_dev, IGB_MIG_STATE_STOP_COPY);
+		if (ret)
+			return ERR_PTR(ret);
+		migf = igb_pci_save_device_data(igb_dev);
+		if (IS_ERR(migf))
+			return ERR_CAST(migf);
+		get_file(migf->filp);
+		igb_dev->saving_migf = migf;
+		return migf->filp;
+	}
+
+	if (cur == VFIO_DEVICE_STATE_STOP_COPY && new == VFIO_DEVICE_STATE_STOP) {
+		igb_disable_fds(igb_dev);
+		ret = igb_set_state(igb_dev, IGB_MIG_STATE_STOP);
+		if (ret)
+			return ERR_PTR(ret);
+		return NULL;
+	}
+
+	if (cur == VFIO_DEVICE_STATE_STOP && new == VFIO_DEVICE_STATE_RESUMING) {
+		struct igb_migration_file *migf;
+
+		ret = igb_set_state(igb_dev, IGB_MIG_STATE_RESUMING);
+		if (ret)
+			return ERR_PTR(ret);
+		migf = igb_pci_resume_device_data(igb_dev);
+		if (IS_ERR(migf))
+			return ERR_CAST(migf);
+		get_file(migf->filp);
+		igb_dev->resuming_migf = migf;
+		return migf->filp;
+	}
+
+	if (cur == VFIO_DEVICE_STATE_RESUMING && new == VFIO_DEVICE_STATE_STOP) {
+		ret = igb_load_data(igb_dev, igb_dev->resuming_migf);
+		if (ret)
+			return ERR_PTR(ret);
+		igb_disable_fds(igb_dev);
+		ret = igb_set_state(igb_dev, IGB_MIG_STATE_STOP);
+		if (ret)
+			return ERR_PTR(ret);
+		return NULL;
+	}
+
 	if (cur == VFIO_DEVICE_STATE_STOP && new == VFIO_DEVICE_STATE_RUNNING) {
 		ret = igb_set_state(igb_dev, IGB_MIG_STATE_RUNNING);
 		if (ret)
@@ -288,6 +689,13 @@ igb_pci_set_device_state(struct vfio_device *vdev,
 		if (IS_ERR(res))
 			break;
 		igb_dev->mig_state = next_state;
+
+		/* A mid-path step should never return an fd */
+		if (WARN_ON(res && new_state != igb_dev->mig_state)) {
+			fput(res);
+			res = ERR_PTR(-EINVAL);
+			break;
+		}
 	}
 	mutex_unlock(&igb_dev->state_mutex);
 	return res;
@@ -344,8 +752,19 @@ static int igb_pci_open_device(struct vfio_device *core_vdev)
 	return 0;
 }
 
+static void igb_close_migratable(struct igb_pci_core_device *igb_dev)
+{
+	mutex_lock(&igb_dev->state_mutex);
+	igb_disable_fds(igb_dev);
+	mutex_unlock(&igb_dev->state_mutex);
+}
+
 static void igb_pci_close_device(struct vfio_device *core_vdev)
 {
+	struct igb_pci_core_device *igb_dev =
+		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
+
+	igb_close_migratable(igb_dev);
 	vfio_pci_core_close_device(core_vdev);
 }
 
@@ -390,6 +809,8 @@ static int igb_vfio_pci_init_dev(struct vfio_device *core_vdev)
 
 	mutex_init(&igb_dev->state_mutex);
 
+	core_vdev->migration_flags = VFIO_MIGRATION_STOP_COPY;
+	core_vdev->mig_ops = &igb_pci_mig_ops;
 	return vfio_pci_core_init_dev(core_vdev);
 }
 
