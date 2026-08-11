@@ -28655,6 +28655,12 @@ L:	kvm@vger.kernel.org
 S:	Maintained
 F:	drivers/vfio/pci/hisilicon/
 
+VFIO IGB PCI DRIVER
+M:	Cédric Le Goater <clg@redhat.com>
+L:	kvm@vger.kernel.org
+S:	Maintained
+F:	drivers/vfio/pci/igb/
+
 VFIO ISM PCI DRIVER
 M:	Julian Ruess <julianr@linux.ibm.com>
 L:	kvm@vger.kernel.org
