@@ -28659,6 +28659,7 @@ VFIO IGB PCI DRIVER
 M:	Cédric Le Goater <clg@redhat.com>
 L:	kvm@vger.kernel.org
 S:	Maintained
+F:	Documentation/networking/device_drivers/ethernet/intel/igb-vfio-pci.rst
 F:	drivers/vfio/pci/igb/
 
 VFIO ISM PCI DRIVER

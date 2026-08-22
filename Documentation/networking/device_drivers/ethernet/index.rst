@@ -34,6 +34,7 @@ Contents:
    intel/fm10k
    intel/idpf
    intel/igb
+   intel/igb-vfio-pci
    intel/igbvf
    intel/ixd
    intel/ixgbe
