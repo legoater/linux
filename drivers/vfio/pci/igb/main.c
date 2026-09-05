@@ -1310,6 +1310,70 @@ static int igb_vfio_pci_init_dev(struct vfio_device *core_vdev)
 	return vfio_pci_core_init_dev(core_vdev);
 }
 
+static bool igb_pci_range_overlaps_dvsec(struct igb_pci_core_device *igb_dev,
+					u64 pos, size_t count)
+{
+	u64 dvsec_end = igb_dev->dvsec_pos + igb_dev->dvsec_len;
+	u64 end = pos + count;
+
+	return igb_dev->dvsec_pos &&
+	       pos < dvsec_end &&
+	       end > igb_dev->dvsec_pos;
+}
+
+static ssize_t igb_pci_read(struct vfio_device *core_vdev,
+			    char __user *buf, size_t count, loff_t *ppos)
+{
+	struct igb_pci_core_device *igb_dev =
+		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
+	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
+	u64 pos = *ppos & VFIO_PCI_OFFSET_MASK;
+	ssize_t ret;
+
+	ret = vfio_pci_core_read(core_vdev, buf, count, ppos);
+	if (ret <= 0)
+		return ret;
+
+	if (index != VFIO_PCI_CONFIG_REGION_INDEX)
+		return ret;
+
+	/*
+	 * The IGB DVSEC is currently the last and only PCIe extended
+	 * capability. Zeroing the complete capability, including its
+	 * extended capability header, removes it from the guest view.
+	 */
+	if (igb_pci_range_overlaps_dvsec(igb_dev, pos, ret)) {
+		u64 start = max_t(u64, pos, igb_dev->dvsec_pos);
+		u64 end = min_t(u64, pos + ret,
+				igb_dev->dvsec_pos + igb_dev->dvsec_len);
+
+		if (clear_user(buf + (start - pos), end - start))
+			return -EFAULT;
+	}
+
+	return ret;
+}
+
+static ssize_t igb_pci_write(struct vfio_device *core_vdev, const char __user *buf,
+			     size_t count, loff_t *ppos)
+{
+	struct igb_pci_core_device *igb_dev =
+		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
+	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
+	u64 pos = *ppos & VFIO_PCI_OFFSET_MASK;
+
+	/*
+	 * The DVSEC is owned and managed by the L0 VMM. Ignore guest
+	 * writes, so that the guest cannot alter the migration state
+	 * maintained by the host.
+	 */
+	if (index == VFIO_PCI_CONFIG_REGION_INDEX &&
+	    igb_pci_range_overlaps_dvsec(igb_dev, pos, count))
+		return count;
+
+	return vfio_pci_core_write(core_vdev, buf, count, ppos);
+}
+
 static const struct vfio_device_ops igb_vfio_pci_ops = {
 	.name = "igb-vfio-pci",
 	.init = igb_vfio_pci_init_dev,
@@ -1319,8 +1383,8 @@ static const struct vfio_device_ops igb_vfio_pci_ops = {
 	.ioctl = vfio_pci_core_ioctl,
 	.get_region_info_caps = vfio_pci_ioctl_get_region_info,
 	.device_feature = vfio_pci_core_ioctl_feature,
-	.read = vfio_pci_core_read,
-	.write = vfio_pci_core_write,
+	.read = igb_pci_read,
+	.write = igb_pci_write,
 	.mmap = vfio_pci_core_mmap,
 	.request = vfio_pci_core_request,
 	.match = vfio_pci_core_match,
