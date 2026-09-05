@@ -1354,13 +1354,55 @@ static ssize_t igb_pci_read(struct vfio_device *core_vdev,
 	return ret;
 }
 
+static int igb_pci_reset_cleanup(struct igb_pci_core_device *igb_dev)
+{
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
+	int ret;
+
+	dev_dbg(&pdev->dev, "reset cleanup (mig_state=%d)\n", igb_dev->mig_state);
+
+	mutex_lock(&igb_dev->state_mutex);
+	igb_disable_fds(igb_dev);
+	igb_pci_dirty_disable(igb_dev);
+
+	/*
+	 * FLR does not clear the DVSEC state preserved by the L0 VMM.
+	 * Restore the DVSEC state machine to RUNNING after reset.
+	 */
+	ret = igb_pci_activate_dvsec(igb_dev);
+
+	igb_dev->mig_state = ret ? VFIO_DEVICE_STATE_ERROR :
+				   VFIO_DEVICE_STATE_RUNNING;
+	mutex_unlock(&igb_dev->state_mutex);
+	return ret;
+}
+
+static bool igb_pci_is_flr_write(struct pci_dev *pdev,
+				 u64 pos, const char __user *buf,
+				 size_t count)
+{
+	int devctl = pdev->pcie_cap + PCI_EXP_DEVCTL;
+	__le16 val;
+
+	if (pos > devctl || pos + count < devctl + sizeof(val))
+		return false;
+
+	if (copy_from_user(&val, buf + (devctl - pos), sizeof(val)))
+		return false;
+
+	return le16_to_cpu(val) & PCI_EXP_DEVCTL_BCR_FLR;
+}
+
 static ssize_t igb_pci_write(struct vfio_device *core_vdev, const char __user *buf,
 			     size_t count, loff_t *ppos)
 {
 	struct igb_pci_core_device *igb_dev =
 		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
+	struct pci_dev *pdev = igb_to_pci_dev(igb_dev);
 	unsigned int index = VFIO_PCI_OFFSET_TO_INDEX(*ppos);
 	u64 pos = *ppos & VFIO_PCI_OFFSET_MASK;
+	bool flr;
+	ssize_t ret;
 
 	/*
 	 * The DVSEC is owned and managed by the L0 VMM. Ignore guest
@@ -1371,7 +1413,36 @@ static ssize_t igb_pci_write(struct vfio_device *core_vdev, const char __user *b
 	    igb_pci_range_overlaps_dvsec(igb_dev, pos, count))
 		return count;
 
-	return vfio_pci_core_write(core_vdev, buf, count, ppos);
+	flr = (index == VFIO_PCI_CONFIG_REGION_INDEX &&
+	       igb_pci_is_flr_write(pdev, pos, buf, count));
+
+	ret = vfio_pci_core_write(core_vdev, buf, count, ppos);
+
+	if (ret > 0 && flr) {
+		if (igb_pci_reset_cleanup(igb_dev))
+			dev_warn(&pdev->dev, "reset cleanup failed after FLR\n");
+	}
+
+	return ret;
+}
+
+static long igb_pci_ioctl(struct vfio_device *core_vdev, unsigned int cmd,
+			  unsigned long arg)
+{
+	struct igb_pci_core_device *igb_dev =
+		container_of(core_vdev, struct igb_pci_core_device, core_device.vdev);
+	long ret;
+
+	ret = vfio_pci_core_ioctl(core_vdev, cmd, arg);
+	if (ret)
+		return ret;
+
+	switch (cmd) {
+	case VFIO_DEVICE_RESET:
+		return igb_pci_reset_cleanup(igb_dev);
+	}
+
+	return 0;
 }
 
 static const struct vfio_device_ops igb_vfio_pci_ops = {
@@ -1380,7 +1451,7 @@ static const struct vfio_device_ops igb_vfio_pci_ops = {
 	.release = igb_vfio_pci_release_dev,
 	.open_device = igb_pci_open_device,
 	.close_device = igb_pci_close_device,
-	.ioctl = vfio_pci_core_ioctl,
+	.ioctl = igb_pci_ioctl,
 	.get_region_info_caps = vfio_pci_ioctl_get_region_info,
 	.device_feature = vfio_pci_core_ioctl_feature,
 	.read = igb_pci_read,
