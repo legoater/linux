@@ -2794,8 +2794,26 @@ out_unlock:
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_sriov_configure);
 
+static void vfio_pci_core_reset_prepare(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+
+	if (vdev->cxl_ops)
+		vdev->cxl_ops->reset_prepare(vdev);
+}
+
+static void vfio_pci_core_reset_done(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+
+	if (vdev->cxl_ops)
+		vdev->cxl_ops->reset_done(vdev);
+}
+
 const struct pci_error_handlers vfio_pci_core_err_handlers = {
 	.error_detected = vfio_pci_core_aer_err_detected,
+	.reset_prepare = vfio_pci_core_reset_prepare,
+	.reset_done = vfio_pci_core_reset_done,
 };
 EXPORT_SYMBOL_GPL(vfio_pci_core_err_handlers);
 
