@@ -643,8 +643,27 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 		goto out_power;
 
 	/* If reset fails because of the device lock, fail this path entirely */
-	ret = pci_try_reset_function(pdev);
-	if (ret == -EAGAIN)
+	if (vdev->cxl_ops && vdev->cxl_ops->reset) {
+		/*
+		 * VM power-on resets a CXL Type-2 device through its DVSEC
+		 * sequence. vconfig is not built yet here, so take memory_lock
+		 * and call the op directly rather than the wrapper.
+		 */
+		down_write(&vdev->memory_lock);
+		ret = vdev->cxl_ops->reset(vdev);
+		up_write(&vdev->memory_lock);
+	} else {
+		ret = pci_try_reset_function(pdev);
+	}
+
+	/*
+	 * -EAGAIN means the reset could not run. For a CXL device any reset
+	 * error must also fail the open: a failed DVSEC reset can leave the HDM
+	 * decoder cleared or unrestored, and continuing would expose the HDM
+	 * region for host access through a decoder in an unknown state.
+	 */
+	if (ret == -EAGAIN ||
+	    (vdev->cxl_ops && vdev->cxl_ops->reset && ret))
 		goto out_disable_device;
 
 	vdev->reset_works = !ret;
@@ -845,16 +864,30 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 	 * overwrite the previously restored configuration information.
 	 */
 	if (vdev->reset_works) {
-		bridge = pci_upstream_bridge(pdev);
-		if (bridge && !pci_dev_trylock(bridge))
-			goto out_restore_state;
-		if (pci_dev_trylock(pdev)) {
-			if (!__pci_reset_function_locked(pdev))
+		if (vdev->cxl_ops && vdev->cxl_ops->reset) {
+			/*
+			 * VM power-off resets a CXL Type-2 device through its
+			 * DVSEC sequence. The sequence takes its own device lock,
+			 * so run it outside the lock below.
+			 * vconfig is already freed here, so call the op directly
+			 * under memory_lock rather than the wrapper.
+			 */
+			down_write(&vdev->memory_lock);
+			if (!vdev->cxl_ops->reset(vdev))
 				vdev->needs_reset = false;
-			pci_dev_unlock(pdev);
+			up_write(&vdev->memory_lock);
+		} else {
+			bridge = pci_upstream_bridge(pdev);
+			if (bridge && !pci_dev_trylock(bridge))
+				goto out_restore_state;
+			if (pci_dev_trylock(pdev)) {
+				if (!__pci_reset_function_locked(pdev))
+					vdev->needs_reset = false;
+				pci_dev_unlock(pdev);
+			}
+			if (bridge)
+				pci_dev_unlock(bridge);
 		}
-		if (bridge)
-			pci_dev_unlock(bridge);
 	}
 
 out_restore_state:
@@ -1592,6 +1625,20 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 	return ret;
 }
 
+/*
+ * Reset the function. A CXL device runs the CXL DVSEC reset sequence in place
+ * of a PCI function reset: it replaces FLR (which would corrupt CXL.mem),
+ * always clears device memory, and restores the HDM decoder. Callers hold
+ * memory_lock for write.
+ */
+int vfio_pci_reset_function(struct vfio_pci_core_device *vdev)
+{
+	if (!vdev->cxl_ops || !vdev->cxl_ops->reset)
+		return pci_try_reset_function(vdev->pdev);
+
+	return vdev->cxl_ops->reset(vdev);
+}
+
 static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 				void __user *arg)
 {
@@ -1614,8 +1661,14 @@ static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 	vfio_pci_set_power_state(vdev, PCI_D0);
 
 	vfio_pci_dma_buf_move(vdev, true);
-	ret = pci_try_reset_function(vdev->pdev);
-	if (__vfio_pci_memory_enabled(vdev))
+	ret = vfio_pci_reset_function(vdev);
+	/*
+	 * Re-arm the dma-bufs on success. A CXL device whose reset failed leaves
+	 * the HDM decoder unrestored and hdm_valid clear, so re-arming its HDM
+	 * dma-buf would map device DMA onto a decoder the fault path still gates;
+	 * keep it revoked until a reset succeeds. Plain vfio-pci is unchanged.
+	 */
+	if (__vfio_pci_memory_enabled(vdev) && (!vdev->cxl_ops || !ret))
 		vfio_pci_dma_buf_move(vdev, false);
 	up_write(&vdev->memory_lock);
 

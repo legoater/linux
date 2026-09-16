@@ -630,7 +630,14 @@ static int vfio_basic_config_write(struct vfio_pci_core_device *vdev, int pos,
 		*virt_cmd &= cpu_to_le16(~mask);
 		*virt_cmd |= cpu_to_le16(new_cmd & mask);
 
-		if (__vfio_pci_memory_enabled(vdev))
+		/*
+		 * Re-arm the dma-bufs on memory-enable, but keep a CXL device's
+		 * HDM dma-buf revoked while the decoder is unrestored (a failed
+		 * reset leaves hdm_valid clear); re-arming would map DMA onto a
+		 * decoder the fault path still gates. Plain vfio-pci is unchanged.
+		 */
+		if (__vfio_pci_memory_enabled(vdev) &&
+		    (!vdev->cxl_ops || vdev->cxl_ops->hdm_active(vdev)))
 			vfio_pci_dma_buf_move(vdev, false);
 		up_write(&vdev->memory_lock);
 	}
@@ -720,7 +727,8 @@ static void vfio_lock_and_set_power_state(struct vfio_pci_core_device *vdev,
 	}
 
 	vfio_pci_set_power_state(vdev, state);
-	if (__vfio_pci_memory_enabled(vdev))
+	if (__vfio_pci_memory_enabled(vdev) &&
+	    (!vdev->cxl_ops || vdev->cxl_ops->hdm_active(vdev)))
 		vfio_pci_dma_buf_move(vdev, false);
 	up_write(&vdev->memory_lock);
 }
@@ -910,8 +918,14 @@ static int vfio_exp_config_write(struct vfio_pci_core_device *vdev, int pos,
 		if (!ret && (cap & PCI_EXP_DEVCAP_FLR)) {
 			vfio_pci_zap_and_down_write_memory_lock(vdev);
 			vfio_pci_dma_buf_move(vdev, true);
-			pci_try_reset_function(vdev->pdev);
-			if (__vfio_pci_memory_enabled(vdev))
+			ret = vfio_pci_reset_function(vdev);
+			/*
+			 * Keep the HDM dma-buf revoked if a CXL reset
+			 * failed; re-arming would map DMA onto an
+			 * unrestored decoder. Mirrors the reset ioctl.
+			 */
+			if (__vfio_pci_memory_enabled(vdev) &&
+			    (!vdev->cxl_ops || !ret))
 				vfio_pci_dma_buf_move(vdev, false);
 			up_write(&vdev->memory_lock);
 		}
@@ -995,8 +1009,14 @@ static int vfio_af_config_write(struct vfio_pci_core_device *vdev, int pos,
 		if (!ret && (cap & PCI_AF_CAP_FLR) && (cap & PCI_AF_CAP_TP)) {
 			vfio_pci_zap_and_down_write_memory_lock(vdev);
 			vfio_pci_dma_buf_move(vdev, true);
-			pci_try_reset_function(vdev->pdev);
-			if (__vfio_pci_memory_enabled(vdev))
+			ret = vfio_pci_reset_function(vdev);
+			/*
+			 * Keep the HDM dma-buf revoked if a CXL reset
+			 * failed; re-arming would map DMA onto an
+			 * unrestored decoder. Mirrors the reset ioctl.
+			 */
+			if (__vfio_pci_memory_enabled(vdev) &&
+			    (!vdev->cxl_ops || !ret))
 				vfio_pci_dma_buf_move(vdev, false);
 			up_write(&vdev->memory_lock);
 		}
@@ -1781,9 +1801,22 @@ static int vfio_cxl_dvsec_write(struct vfio_pci_core_device *vdev, int pos,
 		status2 |= PCI_DVSEC_CXL_CACHE_INV;
 	}
 	if (ctrl2 & PCI_DVSEC_CXL_INIT_CXL_RST) {
+		int ret = 0;
+
 		ctrl2 &= ~PCI_DVSEC_CXL_INIT_CXL_RST;
-		status2 &= ~PCI_DVSEC_CXL_RST_ERR;
-		status2 |= PCI_DVSEC_CXL_RST_DONE;
+
+		if (vdev->cxl_ops && vdev->cxl_ops->reset) {
+			vfio_pci_zap_and_down_write_memory_lock(vdev);
+			vfio_pci_dma_buf_move(vdev, true);
+			ret = vfio_pci_reset_function(vdev);
+			if (__vfio_pci_memory_enabled(vdev) &&
+			    (!vdev->cxl_ops || !ret))
+				vfio_pci_dma_buf_move(vdev, false);
+			up_write(&vdev->memory_lock);
+		}
+
+		status2 &= ~(PCI_DVSEC_CXL_RST_DONE | PCI_DVSEC_CXL_RST_ERR);
+		status2 |= ret ? PCI_DVSEC_CXL_RST_ERR : PCI_DVSEC_CXL_RST_DONE;
 	}
 
 	*pctrl2 = cpu_to_le16(ctrl2);

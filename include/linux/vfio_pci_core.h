@@ -74,6 +74,10 @@ struct vfio_cxl_ops {
 	void	(*close_device)(struct vfio_pci_core_device *vdev);
 	void	(*reset_prepare)(struct vfio_pci_core_device *vdev);
 	void	(*reset_done)(struct vfio_pci_core_device *vdev);
+	/* Run the CXL reset (always clears CXL.mem) in place of FLR */
+	int	(*reset)(struct vfio_pci_core_device *vdev);
+	/* True while the HDM range is valid and its dma-buf may be armed */
+	bool	(*hdm_active)(struct vfio_pci_core_device *vdev);
 	/* Pinned per bound CXL device so vfio-cxl cannot unload under usage */
 	struct module *owner;
 };
