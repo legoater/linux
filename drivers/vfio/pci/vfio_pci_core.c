@@ -2262,6 +2262,15 @@ static int vfio_pci_core_cxl_init(struct vfio_pci_core_device *vdev)
 		return IS_BUILTIN(CONFIG_VFIO_CXL) ? -EPROBE_DEFER : 0;
 
 	ret = ops->init(vdev);
+	/*
+	 * A provider that is not ready yet (for example its CXL port has not
+	 * enumerated) returns -EPROBE_DEFER. Propagate it so the bind retries
+	 * rather than falling back to plain vfio-pci.
+	 */
+	if (ret == -EPROBE_DEFER) {
+		vfio_pci_put_cxl_ops(ops);
+		return ret;
+	}
 	if (ret) {
 		vfio_pci_put_cxl_ops(ops);
 		return ret;
