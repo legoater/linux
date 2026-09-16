@@ -178,6 +178,15 @@ int vfio_pci_core_get_dmabuf_phys(struct vfio_pci_core_device *vdev,
 {
 	struct pci_dev *pdev = vdev->pdev;
 
+	/*
+	 * This resolver only handles PCI BARs. A device-specific region index
+	 * (>= PCI_STD_NUM_BARS) would index pdev->resource[] out of bounds via
+	 * pcim_p2pdma_provider(), so reject it; a driver that exports such a
+	 * region installs its own get_dmabuf_phys.
+	 */
+	if (region_index >= PCI_STD_NUM_BARS)
+		return -EINVAL;
+
 	*provider = pcim_p2pdma_provider(pdev, region_index);
 	if (!*provider)
 		return -EINVAL;
@@ -227,6 +236,7 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	struct vfio_pci_dma_buf *priv;
 	size_t length;
+	u32 index;
 	int ret;
 
 	if (!vdev->pci_ops || !vdev->pci_ops->get_dmabuf_phys)
@@ -243,13 +253,22 @@ int vfio_pci_core_feature_dma_buf(struct vfio_pci_core_device *vdev, u32 flags,
 	if (!get_dma_buf.nr_ranges || get_dma_buf.flags)
 		return -EINVAL;
 
+	index = get_dma_buf.region_index;
+
 	/*
-	 * For PCI the region_index is the BAR number like everything
-	 * else.  Check that PCI resources have been claimed for it.
+	 * A fixed region index is the BAR number; only a BAR can be exported
+	 * and its PCI resource must be claimed. A device-specific region (index
+	 * >= VFIO_PCI_NUM_REGIONS) has no BAR resource and is validated by the
+	 * device's get_dmabuf_phys instead, but the index must name a region
+	 * that exists.
 	 */
-	if (get_dma_buf.region_index >= VFIO_PCI_ROM_REGION_INDEX ||
-	    IS_ERR(vfio_pci_core_get_iomap(vdev, get_dma_buf.region_index)))
+	if (index < VFIO_PCI_NUM_REGIONS) {
+		if (index >= VFIO_PCI_ROM_REGION_INDEX ||
+		    IS_ERR(vfio_pci_core_get_iomap(vdev, index)))
+			return -ENODEV;
+	} else if (index - VFIO_PCI_NUM_REGIONS >= vdev->num_regions) {
 		return -ENODEV;
+	}
 
 	dma_ranges = memdup_array_user(&arg->dma_ranges, get_dma_buf.nr_ranges,
 				       sizeof(*dma_ranges));
