@@ -435,7 +435,24 @@ static int vfio_cxl_add_region(struct vfio_pci_core_device *vdev, u32 subtype,
 static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 {
 	struct vfio_cxl_state *cxl = vdev->cxl;
+	struct pci_dev *pdev = vdev->pdev;
 	int ret;
+
+	/*
+	 * Keep the HDM decoder block out of the guest's direct BAR access: the
+	 * guest reaches it only through the trapped decoder region, and a host
+	 * read of the range through a kernel mapping could abort as an SError.
+	 * Exclude it from mmap, fill reads with -1 and drop writes. The list is
+	 * cleared on close, so re-add it per open.
+	 */
+	ret = vfio_pci_core_add_excluded_range(vdev, pdev->hdm->hdm_bar,
+					       pdev->hdm->hdm_offset,
+					       cxl->hdm_len,
+					       VFIO_PCI_EXCLUDE_MMAP |
+					       VFIO_PCI_EXCLUDE_READ |
+					       VFIO_PCI_EXCLUDE_WRITE);
+	if (ret)
+		return ret;
 
 	/*
 	 * vfio_pci_core_disable() frees all dynamic regions on close, so register
