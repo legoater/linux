@@ -1747,6 +1747,119 @@ static const struct pci_device_id known_bogus_vf_intx_pin[] = {
  * for each area requiring emulated bits, but the array of pointers
  * would be comparable in size (at least for standard config space).
  */
+static int vfio_cxl_dvsec_write(struct vfio_pci_core_device *vdev, int pos,
+				int count, struct perm_bits *perm,
+				int offset, __le32 val)
+{
+	__le16 *pctrl2, *pstatus2;
+	u16 ctrl2, status2;
+	int start;
+
+	count = vfio_default_config_write(vdev, pos, count, perm, offset, val);
+	if (count < 0)
+		return count;
+
+	/* Only Control2 carries the self-clearing doorbells. */
+	if (offset > PCI_DVSEC_CXL_CTRL2 ||
+	    offset + count <= PCI_DVSEC_CXL_CTRL2)
+		return count;
+
+	start = vfio_find_cap_start(vdev, pos);
+	pctrl2 = (__le16 *)&vdev->vconfig[start + PCI_DVSEC_CXL_CTRL2];
+	pstatus2 = (__le16 *)&vdev->vconfig[start + PCI_DVSEC_CXL_STATUS2];
+	ctrl2 = le16_to_cpu(*pctrl2);
+	status2 = le16_to_cpu(*pstatus2);
+
+	/*
+	 * INIT_CACHE_WBI and INIT_CXL_RST are self-clearing doorbells that vfio
+	 * never forwards to hardware. Synthesize their completion in the shadow
+	 * so the guest poll finishes: clear the initiate bit and set the
+	 * matching Status2 completion.
+	 */
+	if (ctrl2 & PCI_DVSEC_CXL_INIT_CACHE_WBI) {
+		ctrl2 &= ~PCI_DVSEC_CXL_INIT_CACHE_WBI;
+		status2 |= PCI_DVSEC_CXL_CACHE_INV;
+	}
+	if (ctrl2 & PCI_DVSEC_CXL_INIT_CXL_RST) {
+		ctrl2 &= ~PCI_DVSEC_CXL_INIT_CXL_RST;
+		status2 &= ~PCI_DVSEC_CXL_RST_ERR;
+		status2 |= PCI_DVSEC_CXL_RST_DONE;
+	}
+
+	*pctrl2 = cpu_to_le16(ctrl2);
+	*pstatus2 = cpu_to_le16(status2);
+
+	return count;
+}
+
+static int init_cxl_dvsec_perm(struct perm_bits *perm, int len)
+{
+	int i;
+
+	if (alloc_perm_bits(perm, len))
+		return -ENOMEM;
+
+	perm->writefn = vfio_cxl_dvsec_write;
+
+	/* Serve the whole CXL DVSEC from the shadow. */
+	for (i = 0; i < len; i++)
+		p_setb(perm, i, (u8)ALL_VIRT, NO_WRITE);
+
+	/*
+	 * Control and Control2 are guest programmable; Capability, Status,
+	 * Lock and the Range registers keep their firmware snapshot, so the
+	 * guest cannot set Config Lock or rewrite the capability and ranges.
+	 */
+	p_setw(perm, PCI_DVSEC_CXL_CTRL, (u16)ALL_VIRT, (u16)ALL_WRITE);
+	p_setw(perm, PCI_DVSEC_CXL_CTRL2, (u16)ALL_VIRT, (u16)ALL_WRITE);
+
+	return 0;
+}
+
+/* Virtualize the CXL DVSEC so a guest cannot reprogram the device through it. */
+static int vfio_cxl_dvsec_init(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+	u32 dword;
+	u16 dvsec;
+	int len, ret;
+
+	dvsec = pci_find_dvsec_capability(pdev, PCI_VENDOR_ID_CXL,
+					  PCI_DVSEC_CXL_DEVICE);
+	if (!dvsec)
+		return 0;
+
+	ret = pci_read_config_dword(pdev, dvsec + PCI_DVSEC_HEADER1, &dword);
+	if (ret)
+		return pcibios_err_to_errno(ret);
+	len = PCI_DVSEC_HEADER1_LEN(dword);
+
+	/*
+	 * The virtualization writes fixed DVSEC offsets up to Status2 (the reset
+	 * doorbell stamps it). A device that reports a shorter DVSEC is not a
+	 * usable Type-2 function; leave it as plain vfio-pci rather than index the
+	 * device-length-sized perm allocation past its end.
+	 */
+	if (len < PCI_DVSEC_CXL_STATUS2 + 2)
+		return 0;
+
+	vdev->cxl_perm = kmalloc_obj(struct perm_bits, GFP_KERNEL_ACCOUNT);
+	if (!vdev->cxl_perm)
+		return -ENOMEM;
+
+	ret = init_cxl_dvsec_perm(vdev->cxl_perm, len);
+	if (ret) {
+		kfree(vdev->cxl_perm);
+		vdev->cxl_perm = NULL;
+		return ret;
+	}
+
+	vdev->cxl_dvsec = dvsec;
+	vdev->cxl_dvsec_len = len;
+
+	return 0;
+}
+
 int vfio_config_init(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -1842,6 +1955,12 @@ int vfio_config_init(struct vfio_pci_core_device *vdev)
 	if (ret)
 		goto out;
 
+	if (vdev->cxl_ops) {
+		ret = vfio_cxl_dvsec_init(vdev);
+		if (ret)
+			goto out;
+	}
+
 	return 0;
 
 out:
@@ -1862,6 +1981,12 @@ void vfio_config_free(struct vfio_pci_core_device *vdev)
 		free_perm_bits(vdev->msi_perm);
 		kfree(vdev->msi_perm);
 		vdev->msi_perm = NULL;
+	}
+	if (vdev->cxl_perm) {
+		free_perm_bits(vdev->cxl_perm);
+		kfree(vdev->cxl_perm);
+		vdev->cxl_perm = NULL;
+		vdev->cxl_dvsec = 0;
 	}
 }
 
@@ -1926,12 +2051,15 @@ ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 			 * of the extended capability list.  Use default, ro
 			 * access, which will virtualize the id and next values.
 			 */
+			cap_start = vfio_find_cap_start(vdev, *ppos);
+
 			if (cap_id > PCI_EXT_CAP_ID_MAX)
 				perm = &direct_ro_perms;
+			else if (cap_id == PCI_EXT_CAP_ID_DVSEC && vdev->cxl_perm &&
+				 cap_start == vdev->cxl_dvsec)
+				perm = vdev->cxl_perm;
 			else
 				perm = &ecap_perms[cap_id];
-
-			cap_start = vfio_find_cap_start(vdev, *ppos);
 		} else {
 			WARN_ON(cap_id > PCI_CAP_ID_MAX);
 
