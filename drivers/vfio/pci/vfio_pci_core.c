@@ -1295,6 +1295,23 @@ int vfio_pci_core_register_dev_region(struct vfio_pci_core_device *vdev,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_register_dev_region);
 
+/*
+ * Unregister the most recently registered dynamic region. Used to unwind a
+ * partially built region set on an open-time error; regions are otherwise
+ * released together in vfio_pci_core_disable().
+ */
+void vfio_pci_core_unregister_dev_region(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_pci_region *region;
+
+	if (WARN_ON(!vdev->num_regions))
+		return;
+
+	region = &vdev->region[--vdev->num_regions];
+	region->ops->release(vdev, region);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_unregister_dev_region);
+
 static int vfio_pci_info_atomic_cap(struct vfio_pci_core_device *vdev,
 				    struct vfio_info_cap *caps)
 {
@@ -1972,8 +1989,28 @@ static void vfio_pci_zap_bars(struct vfio_pci_core_device *vdev)
 	loff_t start = VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_BAR0_REGION_INDEX);
 	loff_t end = VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_ROM_REGION_INDEX);
 	loff_t len = end - start;
+	unsigned int i;
 
 	unmap_mapping_range(core_vdev->inode->i_mapping, start, len, true);
+
+	/*
+	 * The unmap above covers the PCI BARs; mmap-capable device-specific
+	 * regions (e.g. a vfio-cxl HDM window) sit above that range, so revoke
+	 * them here too, or a Memory-Space disable, D3/PM transition, or reset
+	 * would leave the guest a live mapping into quiesced device memory.
+	 * Callers hold memory_lock, so the region array is stable.
+	 */
+	for (i = 0; i < vdev->num_regions; i++) {
+		struct vfio_pci_region *region = &vdev->region[i];
+		loff_t roff;
+
+		if (!(region->flags & VFIO_REGION_INFO_FLAG_MMAP))
+			continue;
+
+		roff = VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_NUM_REGIONS + i);
+		unmap_mapping_range(core_vdev->inode->i_mapping, roff,
+				    region->size, true);
+	}
 }
 
 void vfio_pci_zap_and_down_write_memory_lock(struct vfio_pci_core_device *vdev)
