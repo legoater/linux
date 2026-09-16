@@ -514,8 +514,46 @@ static void vfio_cxl_reset_prepare(struct vfio_pci_core_device *vdev)
 {
 }
 
+/*
+ * A secondary bus reset only reaches a CXL endpoint when the upstream port
+ * has SBR unmasked (CXL r3.1 sec 8.1.5.2); otherwise the Bridge Control SBR
+ * bit is ignored and the decoder is left intact. Mirrors the cxl_sbr_masked()
+ * check the PCI core uses for its own CXL bus reset.
+ */
+static bool vfio_cxl_sbr_unmasked(struct pci_dev *pdev)
+{
+	struct pci_dev *bridge = pci_upstream_bridge(pdev);
+	u16 dvsec, ctl;
+
+	if (!bridge)
+		return false;
+
+	dvsec = pci_find_dvsec_capability(bridge, PCI_VENDOR_ID_CXL,
+					  PCI_DVSEC_CXL_PORT);
+	if (!dvsec)
+		return false;
+
+	if (pci_read_config_word(bridge, dvsec + PCI_DVSEC_CXL_PORT_CTL, &ctl))
+		return false;
+
+	return ctl & PCI_DVSEC_CXL_PORT_CTL_UNMASK_SBR;
+}
+
 static void vfio_cxl_reset_done(struct vfio_pci_core_device *vdev)
 {
+	struct vfio_cxl_state *cxl = vdev->cxl;
+
+	/*
+	 * VFIO_DEVICE_PCI_HOT_RESET drives a plain secondary bus reset, not the
+	 * CXL-aware cxl_reset_bus_function(), so nothing restores the HDM
+	 * decoder here. When the upstream port has SBR unmasked the reset
+	 * decommits the decoder; gate host access to the HDM range so a later
+	 * fault cannot insert a PFN into a dead decoder. A VFIO_DEVICE_RESET
+	 * then runs the CXL reset sequence and restores it. A masked SBR is a
+	 * no-op and leaves the decoder intact.
+	 */
+	if (vfio_cxl_sbr_unmasked(vdev->pdev))
+		cxl->hdm_valid = false;
 }
 
 static const struct vfio_cxl_ops vfio_cxl_ops = {
