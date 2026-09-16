@@ -89,6 +89,15 @@ static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 		goto err;
 	}
 
+	/*
+	 * vfio-pci-core requests the whole component-register BAR when the
+	 * guest opens the device. Declare that BAR owned so the CXL core
+	 * ioremaps the HDM and RAS sub-blocks without claiming them, and the
+	 * full-BAR request does not collide.
+	 */
+	cxl_reg_map_add_owned_resource(&cxl->cxlds.reg_map,
+				       pci_resource_n(pdev, pdev->hdm->hdm_bar));
+
 	if (!cxl->cxlds.reg_map.component_map.hdm_decoder.valid) {
 		pci_err(pdev, "vfio-cxl: HDM decoder registers not found\n");
 		ret = -ENODEV;
