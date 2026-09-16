@@ -589,6 +589,8 @@ static const struct dev_pm_ops vfio_pci_core_pm_ops = {
 			   NULL)
 };
 
+static void vfio_pci_free_excluded_ranges(struct vfio_pci_core_device *vdev);
+
 int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -655,6 +657,22 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 		vdev->msix_offset = table & PCI_MSIX_TABLE_OFFSET;
 		vdev->msix_size = ((flags & PCI_MSIX_FLAGS_QSIZE) + 1) * 16;
 		vdev->has_dyn_msix = pci_msix_can_alloc_dyn(pdev);
+
+		/*
+		 * Virtualize the MSI-X table through the excluded-range list:
+		 * reads fill -1 and writes are dropped so the guest never
+		 * reaches the hardware table directly.
+		 */
+		ret = vfio_pci_core_add_excluded_range(vdev, vdev->msix_bar,
+						       vdev->msix_offset,
+						       vdev->msix_size,
+						       VFIO_PCI_EXCLUDE_READ |
+						       VFIO_PCI_EXCLUDE_WRITE);
+		if (ret) {
+			vfio_pci_free_excluded_ranges(vdev);
+			vfio_config_free(vdev);
+			goto out_free_zdev;
+		}
 	} else {
 		vdev->msix_bar = 0xFF;
 		vdev->has_dyn_msix = false;
@@ -741,6 +759,7 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 	vdev->region = NULL; /* don't krealloc a freed pointer */
 
 	vfio_config_free(vdev);
+	vfio_pci_free_excluded_ranges(vdev);
 
 	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
 		bar = i + PCI_STD_RESOURCES;

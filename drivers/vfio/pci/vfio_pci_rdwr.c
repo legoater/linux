@@ -256,21 +256,51 @@ ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 		}
 	}
 
-	if (bar == vdev->msix_bar) {
-		x_start = vdev->msix_offset;
-		x_end = vdev->msix_offset + vdev->msix_size;
-	}
-
 	/*
-	 * A provider-excluded sub-range is filled with -1 on read and dropped on
-	 * write for the same reason: the guest reaches it only through the trap.
-	 * An access spans at most one exclusion window.
+	 * The MSI-X table and any provider-excluded sub-ranges (such as a CXL
+	 * HDM decoder block) are filled with -1 on read and dropped on write:
+	 * the guest reaches them only through the virtualized path, never the
+	 * hardware directly. A BAR can hold several such windows and a single
+	 * access may span more than one, so walk the access one window at a
+	 * time. The ROM BAR uses the single trailing window set above.
 	 */
-	vfio_pci_bar_find_exclusion(vdev, bar, pos, count, iswrite,
-				    &x_start, &x_end);
+	if (bar == PCI_ROM_RESOURCE) {
+		done = vfio_pci_core_do_io_rw(vdev, res->flags & IORESOURCE_MEM,
+					      io, buf, pos, count, x_start, x_end,
+					      iswrite, max_width);
+	} else {
+		done = 0;
+		while (count) {
+			size_t chunk;
+			ssize_t ret;
 
-	done = vfio_pci_core_do_io_rw(vdev, res->flags & IORESOURCE_MEM, io, buf, pos,
-				      count, x_start, x_end, iswrite, max_width);
+			x_start = 0;
+			x_end = 0;
+			if (vfio_pci_bar_find_exclusion(vdev, bar, pos, count,
+							iswrite, &x_start,
+							&x_end))
+				chunk = min(count, (size_t)(x_end - pos));
+			else
+				chunk = count;
+
+			ret = vfio_pci_core_do_io_rw(vdev,
+						     res->flags & IORESOURCE_MEM,
+						     io, buf, pos, chunk,
+						     x_start, x_end, iswrite,
+						     max_width);
+			if (ret < 0) {
+				if (!done)
+					done = ret;
+				break;
+			}
+			done += ret;
+			pos += ret;
+			buf += ret;
+			count -= ret;
+			if ((size_t)ret < chunk)
+				break;
+		}
+	}
 
 	if (done >= 0)
 		*ppos += done;
