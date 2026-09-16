@@ -632,6 +632,45 @@ static void vfio_cxl_reset_done(struct vfio_pci_core_device *vdev)
 		cxl->hdm_valid = false;
 }
 
+/*
+ * Run the CXL DVSEC reset sequence in place of a PCI function reset. A CXL
+ * Type-2 function must not take an FLR (it would corrupt CXL.mem), so the vfio
+ * reset points route here. The sequence resets the function, always clearing
+ * device memory, and restores the HDM decoder. The caller holds memory_lock,
+ * and this path does not hold the PCI device lock, so cxl_reset_dvsec_sequence()
+ * can take it.
+ */
+static int vfio_cxl_reset(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	int ret;
+
+	lockdep_assert_held_write(&vdev->memory_lock);
+
+	/* Host CPU access to the HDM range is unsafe until the decoder is back. */
+	cxl->hdm_valid = false;
+
+	ret = cxl_reset_dvsec_sequence(vdev->pdev);
+	if (!ret)
+		cxl->hdm_valid = true;
+
+	return ret;
+}
+
+/*
+ * The HDM dma-buf may be armed only while the decoder is valid. After a failed
+ * reset hdm_valid is clear, so the generic memory-enable re-arm must skip the
+ * dma-buf rather than map DMA onto an unrestored decoder.
+ */
+static bool vfio_cxl_hdm_active(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+
+	lockdep_assert_held_write(&vdev->memory_lock);
+
+	return cxl->hdm_valid;
+}
+
 static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.init		= vfio_cxl_init_device,
 	.release	= vfio_cxl_release_device,
@@ -639,6 +678,8 @@ static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.close_device	= vfio_cxl_close_device,
 	.reset_prepare	= vfio_cxl_reset_prepare,
 	.reset_done	= vfio_cxl_reset_done,
+	.reset		= vfio_cxl_reset,
+	.hdm_active	= vfio_cxl_hdm_active,
 	.owner		= THIS_MODULE,
 };
 
