@@ -11,6 +11,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/pci-p2pdma.h>
 #include <linux/range.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -27,6 +28,7 @@
  * @hdm_regs: mapped HDM decoder registers, read live by the decoder region
  * @hdm_len: length of the HDM decoder register block
  * @hdm_valid: true when host CPU access to the HDM range is safe; under memory_lock
+ * @mem_region_index: vfio region index of the mmap-able HDM memory region
  */
 struct vfio_cxl_state {
 	struct cxl_dev_state cxlds;
@@ -36,6 +38,7 @@ struct vfio_cxl_state {
 	void __iomem *hdm_regs;
 	u32 hdm_len;
 	bool hdm_valid;
+	unsigned int mem_region_index;
 };
 
 static unsigned long vfio_cxl_mem_pgoff(struct vm_area_struct *vma,
@@ -289,6 +292,50 @@ static void vfio_cxl_release_hpa(void *data)
 	release_mem_region(cxl->hpa_range.start, range_len(&cxl->hpa_range));
 }
 
+/*
+ * Resolve the physical range that backs a dma-buf export. The core exporter
+ * only knows BARs; teach it the HDM memory region so a guest IOAS can map the
+ * coherent window by fd (IOMMU_IOAS_MAP_FILE) instead of the removed PFNMAP
+ * work-around. Real BARs stay on the byte-identical core path.
+ */
+static int vfio_cxl_get_dmabuf_phys(struct vfio_pci_core_device *vdev,
+				    struct p2pdma_provider **provider,
+				    unsigned int region_index,
+				    struct phys_vec *phys_vec,
+				    struct vfio_region_dma_range *dma_ranges,
+				    size_t nr_ranges)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+
+	/* Real BARs go through the core P2P exporter unchanged. */
+	if (region_index < VFIO_PCI_NUM_REGIONS)
+		return vfio_pci_core_get_dmabuf_phys(vdev, provider,
+						     region_index, phys_vec,
+						     dma_ranges, nr_ranges);
+
+	/* Of the device regions, only the HDM memory window is exportable. */
+	if (region_index != cxl->mem_region_index)
+		return -EINVAL;
+
+	/*
+	 * The HDM window is coherent host memory, not BAR MMIO, so it has no
+	 * p2pdma provider of its own. Borrow BAR 0's: the P2P properties match
+	 * and the iommufd importer does not consume the provider. The sgt map
+	 * path (real peer DMA) is not supported for the HDM window.
+	 */
+	*provider = pcim_p2pdma_provider(vdev->pdev, 0);
+	if (!*provider)
+		return -EINVAL;
+
+	return vfio_pci_core_fill_phys_vec(phys_vec, dma_ranges, nr_ranges,
+					  cxl->hpa_range.start,
+					  range_len(&cxl->hpa_range));
+}
+
+static const struct vfio_pci_device_ops vfio_cxl_pci_dev_ops = {
+	.get_dmabuf_phys = vfio_cxl_get_dmabuf_phys,
+};
+
 static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -482,6 +529,19 @@ static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 				  VFIO_REGION_INFO_FLAG_MMAP);
 	if (ret)
 		return ret;
+
+	/* Record where the HDM memory region landed for the dma-buf export. */
+	cxl->mem_region_index = VFIO_PCI_NUM_REGIONS + vdev->num_regions - 1;
+
+	/*
+	 * Override the device ops so a dma-buf export of the HDM memory region
+	 * resolves to the coherent host range. This is done at open, not init:
+	 * vfio_pci_probe() resets pci_ops after vfio_alloc_device() returns, so
+	 * an override installed during init would be clobbered. Only a CXL device
+	 * reaches this hook (cxl_ops is set on init success), so a fallback to
+	 * plain vfio-pci keeps the core ops.
+	 */
+	vdev->pci_ops = &vfio_cxl_pci_dev_ops;
 
 	ret = vfio_cxl_add_region(vdev, VFIO_REGION_SUBTYPE_CXL_COMP_REGS,
 				  &vfio_cxl_comp_regops, cxl->hdm_len,
