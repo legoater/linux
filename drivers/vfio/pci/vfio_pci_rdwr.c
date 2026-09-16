@@ -261,6 +261,14 @@ ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 		x_end = vdev->msix_offset + vdev->msix_size;
 	}
 
+	/*
+	 * A provider-excluded sub-range is filled with -1 on read and dropped on
+	 * write for the same reason: the guest reaches it only through the trap.
+	 * An access spans at most one exclusion window.
+	 */
+	vfio_pci_bar_find_exclusion(vdev, bar, pos, count, iswrite,
+				    &x_start, &x_end);
+
 	done = vfio_pci_core_do_io_rw(vdev, res->flags & IORESOURCE_MEM, io, buf, pos,
 				      count, x_start, x_end, iswrite, max_width);
 
