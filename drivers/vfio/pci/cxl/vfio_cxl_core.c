@@ -7,10 +7,12 @@
 
 #include <linux/cleanup.h>
 #include <linux/io.h>
+#include <linux/memory-failure.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/range.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vfio_pci_core.h>
 #include <cxl/cxl.h>
@@ -21,12 +23,14 @@
  * @cxlds: CXL device state; kept first for devm_cxl_dev_state_create()
  * @cxlmd: memory device joined to the CXL topology at bind
  * @hpa_range: host physical range of the HDM region
+ * @hdm_pfn_space: HDM-region pfn range registered with memory_failure()
  * @hdm_valid: true when host CPU access to the HDM range is safe; under memory_lock
  */
 struct vfio_cxl_state {
 	struct cxl_dev_state cxlds;
 	struct cxl_memdev *cxlmd;
 	struct range hpa_range;
+	struct pfn_address_space hdm_pfn_space;
 	bool hdm_valid;
 };
 
@@ -151,6 +155,62 @@ static const struct vfio_pci_regops vfio_cxl_mem_regops = {
 	.mmap = vfio_cxl_mem_mmap,
 	.release = vfio_cxl_region_release,
 };
+
+/*
+ * Map a poisoned HDM-region pfn back to the file offset of each user mapping so
+ * memory_failure() can unmap it and signal the fd holder. The region is a
+ * single linear range at hpa_range.start; recover the per-vma file offset the
+ * same way the fault handler derived the pfn.
+ */
+static int vfio_cxl_pfn_to_vma_pgoff(struct vm_area_struct *vma,
+				     unsigned long pfn, pgoff_t *pgoff)
+{
+	struct vfio_pci_core_device *vdev;
+	struct vfio_cxl_state *cxl;
+	pgoff_t vma_off, pfn_off;
+	unsigned long start_pfn;
+
+	if (vma->vm_ops != &vfio_cxl_mem_vm_ops)
+		return -ENOENT;
+
+	vdev = vma->vm_private_data;
+	cxl = vdev->cxl;
+
+	start_pfn = PHYS_PFN(cxl->hpa_range.start);
+	if (pfn < start_pfn ||
+	    pfn >= start_pfn + (range_len(&cxl->hpa_range) >> PAGE_SHIFT))
+		return -EFAULT;
+
+	pfn_off = pfn - start_pfn;
+	vma_off = vma->vm_pgoff &
+		  ((1UL << (VFIO_PCI_OFFSET_SHIFT - PAGE_SHIFT)) - 1);
+	/* Skip VMAs that do not map the pfn, e.g. a partial mmap of the region. */
+	if (pfn_off < vma_off || pfn_off - vma_off >= vma_pages(vma))
+		return -EFAULT;
+
+	*pgoff = vma->vm_pgoff + (pfn_off - vma_off);
+	return 0;
+}
+
+/*
+ * The HDM region is struct-page-less device memory, so a memory error on it
+ * cannot be routed through the normal page path. Register the range with
+ * memory_failure() so such an error is contained to unmapping the range and a
+ * SIGBUS to the fd holder instead of escalating to a host SError.
+ */
+static int vfio_cxl_register_pfn_space(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	unsigned long start_pfn = PHYS_PFN(cxl->hpa_range.start);
+
+	cxl->hdm_pfn_space.node.start = start_pfn;
+	cxl->hdm_pfn_space.node.last =
+		start_pfn + (range_len(&cxl->hpa_range) >> PAGE_SHIFT) - 1;
+	cxl->hdm_pfn_space.mapping = vdev->vdev.inode->i_mapping;
+	cxl->hdm_pfn_space.pfn_to_vma_pgoff = vfio_cxl_pfn_to_vma_pgoff;
+
+	return register_pfn_address_space(&cxl->hdm_pfn_space);
+}
 
 static void vfio_cxl_release_hpa(void *data)
 {
@@ -322,6 +382,16 @@ static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 		return ret;
 
 	/*
+	 * The HDM region is advertised mmap-able, so a fd holder can fault its
+	 * struct-page-less device memory in from the host CPU. Register it with
+	 * memory_failure() to contain a memory error. -EOPNOTSUPP means
+	 * CONFIG_MEMORY_FAILURE is off, so run without containment.
+	 */
+	ret = vfio_cxl_register_pfn_space(vdev);
+	if (ret && ret != -EOPNOTSUPP)
+		goto err_unregister_mem;
+
+	/*
 	 * The decoder is firmware-committed, so host access to the HDM range is
 	 * safe. Open the access gate; reset and power transitions clear it until
 	 * the decoder is restored.
@@ -329,6 +399,11 @@ static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 	cxl->hdm_valid = true;
 
 	return 0;
+
+err_unregister_mem:
+	vfio_pci_core_unregister_dev_region(vdev);
+
+	return ret;
 }
 
 static void vfio_cxl_close_device(struct vfio_pci_core_device *vdev)
@@ -336,6 +411,7 @@ static void vfio_cxl_close_device(struct vfio_pci_core_device *vdev)
 	struct vfio_cxl_state *cxl = vdev->cxl;
 
 	cxl->hdm_valid = false;
+	unregister_pfn_address_space(&cxl->hdm_pfn_space);
 }
 
 static void vfio_cxl_reset_prepare(struct vfio_pci_core_device *vdev)
