@@ -1398,3 +1398,56 @@ int cxl_reset_function(struct pci_dev *pdev, bool probe)
 	cxl_pci_target_reset_done(pdev, &target_prepared);
 	return rc;
 }
+
+/* True when a function-scoped CXL reset is available for @pdev. */
+bool cxl_reset_capable(struct pci_dev *pdev)
+{
+	u16 cap;
+
+	if (cxl_reset_get_dvsec(pdev, &cap) < 0)
+		return false;
+
+	if (pdev->multifunction || pci_num_vf(pdev))
+		return false;
+
+	return cxl_reset_hdm_available(pdev);
+}
+EXPORT_SYMBOL_FOR_MODULES(cxl_reset_capable, "vfio-cxl");
+
+/*
+ * Run the DVSEC reset sequence and restore HDM state for a caller that owns
+ * device quiesce and PCI config save/restore, such as vfio-pci.
+ * The HDM range collection and host CPU cache flush that cxl_reset_function()
+ * performs for host-owned memory are skipped as that memory belongs to the
+ * guest.
+ */
+int cxl_reset_dvsec_sequence(struct pci_dev *pdev)
+{
+	bool target_prepared = false;
+	bool reset_initiated = false;
+	int dvsec;
+	int rc;
+	u16 cap;
+
+	dvsec = cxl_reset_get_dvsec(pdev, &cap);
+	if (dvsec < 0)
+		return dvsec;
+
+	if (pdev->multifunction || pci_num_vf(pdev))
+		return -ENOTTY;
+
+	if (!pci_dev_trylock(pdev))
+		return -EBUSY;
+
+	rc = cxl_reset_execute(pdev, &target_prepared, &reset_initiated, dvsec,
+			       cap);
+	if (!rc)
+		rc = cxl_restore_state_after_pci_reset(pdev);
+	else if (reset_initiated)
+		cxl_reset_save_disabled_state(pdev);
+
+	cxl_pci_target_reset_done(pdev, &target_prepared);
+	pci_dev_unlock(pdev);
+	return rc;
+}
+EXPORT_SYMBOL_FOR_MODULES(cxl_reset_dvsec_sequence, "vfio-cxl");
