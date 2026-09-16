@@ -325,6 +325,14 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 	bool needs_restore = false, needs_save = false;
 	int ret;
 
+	/*
+	 * A low-power transition would reset the CXL Type-2 function and lose
+	 * its CXL.mem contents, so keep it in D0 regardless of the guest or
+	 * VMM request.
+	 */
+	if (vdev->cxl_ops && state > PCI_D0)
+		state = PCI_D0;
+
 	/* Prevent changing power state for PFs with VFs enabled */
 	if (state > PCI_D0) {
 		lockdep_assert_held_write(&vdev->memory_lock);
@@ -373,6 +381,14 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 static int vfio_pci_runtime_pm_entry(struct vfio_pci_core_device *vdev,
 				     struct eventfd_ctx *efdctx)
 {
+	/*
+	 * Low power entry lets the PCI core autosuspend the device to D3hot,
+	 * which would soft-reset a CXL Type-2 device and lose its coherent HDM
+	 * memory. Refuse it for CXL; the device stays in D0.
+	 */
+	if (vdev->cxl_ops)
+		return -EINVAL;
+
 	/*
 	 * The vdev power related flags are protected with 'memory_lock'
 	 * semaphore.
