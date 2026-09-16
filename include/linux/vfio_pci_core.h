@@ -162,6 +162,7 @@ struct vfio_pci_core_device {
 	struct notifier_block	nb;
 	struct rw_semaphore	memory_lock;
 	struct list_head	dmabufs;
+	struct list_head	excluded_ranges;
 };
 
 enum vfio_pci_io_width {
@@ -172,6 +173,19 @@ enum vfio_pci_io_width {
 };
 
 /* Will be exported for vfio pci drivers usage */
+/*
+ * A provider can keep a BAR sub-range off the direct guest path, reached only
+ * through its own trap. The flags select which paths are excluded: mmap, and
+ * region read and write (an excluded read fills -1, an excluded write is
+ * dropped).
+ */
+#define VFIO_PCI_EXCLUDE_MMAP	BIT(0)
+#define VFIO_PCI_EXCLUDE_READ	BIT(1)
+#define VFIO_PCI_EXCLUDE_WRITE	BIT(2)
+
+int vfio_pci_core_add_excluded_range(struct vfio_pci_core_device *vdev, int bar,
+				     u64 start, u64 size, u32 flags);
+
 int vfio_pci_core_register_dev_region(struct vfio_pci_core_device *vdev,
 				      unsigned int type, unsigned int subtype,
 				      const struct vfio_pci_regops *ops,

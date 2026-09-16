@@ -44,6 +44,15 @@ ssize_t vfio_pci_config_rw_single(struct vfio_pci_core_device *vdev,
 ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			size_t count, loff_t *ppos, bool iswrite);
 
+/*
+ * If a read (or write) to [pos, pos + count) on @bar overlaps an excluded
+ * range, report the byte window do_io_rw() should fill with -1 (or drop) and
+ * return true. A single access spans at most one such window.
+ */
+bool vfio_pci_bar_find_exclusion(struct vfio_pci_core_device *vdev, int bar,
+				 loff_t pos, size_t count, bool iswrite,
+				 size_t *x_start, size_t *x_end);
+
 #ifdef CONFIG_VFIO_PCI_VGA
 ssize_t vfio_pci_vga_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			size_t count, loff_t *ppos, bool iswrite);
