@@ -591,6 +591,21 @@ static const struct dev_pm_ops vfio_pci_core_pm_ops = {
 
 static void vfio_pci_free_excluded_ranges(struct vfio_pci_core_device *vdev);
 
+static void vfio_pci_core_unmap_bars(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+	int i, bar;
+
+	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+		bar = i + PCI_STD_RESOURCES;
+		if (IS_ERR_OR_NULL(vdev->barmap[bar]))
+			continue;
+		pci_iounmap(pdev, vdev->barmap[bar]);
+		pci_release_selected_regions(pdev, 1 << bar);
+		vdev->barmap[bar] = NULL;
+	}
+}
+
 int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -683,8 +698,19 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 
 	vfio_pci_core_map_bars(vdev);
 
+	if (vdev->cxl_ops) {
+		ret = vdev->cxl_ops->open_device(vdev);
+		if (ret)
+			goto out_free_config;
+	}
+
 	return 0;
 
+out_free_config:
+	/* A failed first open never reaches vfio_pci_core_disable(). */
+	vfio_pci_core_unmap_bars(vdev);
+	vfio_pci_free_excluded_ranges(vdev);
+	vfio_config_free(vdev);
 out_free_zdev:
 	vfio_pci_zdev_close_device(vdev);
 out_free_state:
@@ -705,7 +731,7 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 	struct pci_dev *pdev = vdev->pdev;
 	struct vfio_pci_dummy_resource *dummy_res, *tmp;
 	struct vfio_pci_ioeventfd *ioeventfd, *ioeventfd_tmp;
-	int i, bar;
+	int i;
 
 	/* For needs_reset */
 	lockdep_assert_held(&vdev->vdev.dev_set->lock);
@@ -761,14 +787,7 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 	vfio_config_free(vdev);
 	vfio_pci_free_excluded_ranges(vdev);
 
-	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
-		bar = i + PCI_STD_RESOURCES;
-		if (IS_ERR_OR_NULL(vdev->barmap[bar]))
-			continue;
-		pci_iounmap(pdev, vdev->barmap[bar]);
-		pci_release_selected_regions(pdev, 1 << bar);
-		vdev->barmap[bar] = NULL;
-	}
+	vfio_pci_core_unmap_bars(vdev);
 
 	list_for_each_entry_safe(dummy_res, tmp,
 				 &vdev->dummy_resources_list, res_next) {
@@ -850,6 +869,9 @@ void vfio_pci_core_close_device(struct vfio_device *core_vdev)
 	eeh_dev_release(vdev->pdev);
 #endif
 	vfio_pci_dma_buf_cleanup(vdev);
+
+	if (vdev->cxl_ops)
+		vdev->cxl_ops->close_device(vdev);
 
 	vfio_pci_core_disable(vdev);
 
