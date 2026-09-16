@@ -216,6 +216,13 @@ void __iomem *devm_cxl_iomap_block(struct device *dev, resource_size_t addr,
 }
 EXPORT_SYMBOL_NS_GPL(devm_cxl_iomap_block, "CXL");
 
+void cxl_reg_map_add_owned_resource(struct cxl_register_map *map,
+				    struct resource *res)
+{
+	map->owned = res;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_reg_map_add_owned_resource, "CXL");
+
 int cxl_map_component_regs(const struct cxl_register_map *map,
 			   struct cxl_component_regs *regs,
 			   unsigned long map_mask)
@@ -234,6 +241,7 @@ int cxl_map_component_regs(const struct cxl_register_map *map,
 		struct mapinfo *mi = &mapinfo[i];
 		resource_size_t addr;
 		resource_size_t length;
+		struct resource res;
 
 		if (!mi->rmap->valid)
 			continue;
@@ -241,8 +249,13 @@ int cxl_map_component_regs(const struct cxl_register_map *map,
 			continue;
 		addr = map->resource + mi->rmap->offset;
 		length = mi->rmap->size;
-		*(mi->addr) = devm_cxl_iomap_block(host, addr, length);
-		if (!*(mi->addr))
+		res = DEFINE_RES_MEM(addr, length);
+
+		if (map->owned && resource_contains(map->owned, &res))
+			*mi->addr = devm_cxl_ioremap_block(host, addr, length);
+		else
+			*mi->addr = devm_cxl_iomap_block(host, addr, length);
+		if (!*mi->addr)
 			return -ENOMEM;
 	}
 
