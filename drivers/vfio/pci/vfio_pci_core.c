@@ -2271,9 +2271,17 @@ static int vfio_pci_core_cxl_init(struct vfio_pci_core_device *vdev)
 		vfio_pci_put_cxl_ops(ops);
 		return ret;
 	}
+	/*
+	 * Any other failure is non-fatal: a CXL device that cannot be brought
+	 * up as Type-2 still works as plain vfio-pci, so log and continue
+	 * rather than failing the bind.
+	 */
 	if (ret) {
+		pci_warn(vdev->pdev,
+			 "CXL init failed (%d), continuing as plain vfio-pci\n",
+			 ret);
 		vfio_pci_put_cxl_ops(ops);
-		return ret;
+		return 0;
 	}
 
 	vdev->cxl_ops = ops;
