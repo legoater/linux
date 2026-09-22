@@ -1464,6 +1464,10 @@ static const struct vfio_device_ops igb_vfio_pci_ops = {
 	.detach_ioas = vfio_iommufd_physical_detach_ioas,
 };
 
+static const struct vfio_pci_device_ops igb_vfio_pci_dev_ops = {
+	.get_dmabuf_phys = vfio_pci_core_get_dmabuf_phys,
+};
+
 static int igb_vfio_pci_probe(struct pci_dev *pdev,
 			      const struct pci_device_id *id)
 {
@@ -1476,7 +1480,7 @@ static int igb_vfio_pci_probe(struct pci_dev *pdev,
 		return PTR_ERR(igb_dev);
 
 	dev_set_drvdata(&pdev->dev, &igb_dev->core_device);
-
+	igb_dev->core_device.pci_ops = &igb_vfio_pci_dev_ops;
 	ret = vfio_pci_core_register_device(&igb_dev->core_device);
 	if (ret)
 		goto out_put_vdev;
