@@ -5060,6 +5060,7 @@ done:
 
 static int cxl_reset_bus_function(struct pci_dev *dev, bool probe)
 {
+	struct cxl_hdm_info *snapshot __free(kfree) = NULL;
 	struct pci_dev *bridge;
 	u16 dvsec, reg, val;
 	int rc;
@@ -5082,6 +5083,16 @@ static int cxl_reset_bus_function(struct pci_dev *dev, bool probe)
 	if (rc)
 		return -ENOTTY;
 
+	snapshot = pci_cxl_reset_prepare(dev);
+	if (IS_ERR(snapshot))
+		return PTR_ERR(snapshot);
+
+	/* Raw reset callers may not have saved the PCI state needed for restore. */
+	if (snapshot && !dev->state_saved) {
+		pci_err(dev, "CXL bus reset requires saved PCI state\n");
+		return -EINVAL;
+	}
+
 	rc = pci_dev_reset_iommu_prepare(dev);
 	if (rc) {
 		pci_err(dev, "failed to stop IOMMU for a PCI reset: %d\n", rc);
@@ -5101,6 +5112,9 @@ static int cxl_reset_bus_function(struct pci_dev *dev, bool probe)
 	if (reg != val)
 		pci_write_config_word(bridge, dvsec + PCI_DVSEC_CXL_PORT_CTL,
 				      reg);
+
+	if (!rc && snapshot)
+		rc = cxl_restore_state_after_pci_reset(dev, snapshot);
 
 	pci_dev_reset_iommu_done(dev);
 	return rc;
