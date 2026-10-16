@@ -241,16 +241,41 @@ static const struct dev_pm_ops vfio_pci_pm_ops = {
 	SET_RUNTIME_PM_OPS(vfio_pci_pm_suspend, vfio_pci_pm_resume, NULL)
 };
 
-static pci_ers_result_t vfio_pci_aer_err_detected(struct pci_dev *pdev,
-					       pci_channel_state_t state)
+static void vfio_pci_reset_prepare(struct pci_dev *pdev)
 {
-	struct vfio_pci_core_device *vdev = pci_get_drvdata(pdev);
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
 
+	vfio_pci_core_reset_prepare(vdev);
+}
+
+static void vfio_pci_reset_done(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+
+	vfio_pci_core_reset_done(vdev);
+}
+
+static pci_ers_result_t vfio_pci_error_detected(struct pci_dev *pdev,
+						pci_channel_state_t state)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+
+	vfio_pci_core_error_detected(vdev);
 	return vfio_pci_core_aer_err_detected(vdev);
 }
 
+static void vfio_pci_error_resume(struct pci_dev *pdev)
+{
+	struct vfio_pci_core_device *vdev = dev_get_drvdata(&pdev->dev);
+
+	vfio_pci_core_error_resume(vdev);
+}
+
 static const struct pci_error_handlers vfio_pci_err_handlers = {
-	.error_detected = vfio_pci_aer_err_detected,
+	.error_detected = vfio_pci_error_detected,
+	.reset_prepare = vfio_pci_reset_prepare,
+	.reset_done = vfio_pci_reset_done,
+	.resume = vfio_pci_error_resume,
 };
 
 static struct pci_driver vfio_pci_driver = {
