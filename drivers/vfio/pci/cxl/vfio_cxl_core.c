@@ -18,6 +18,7 @@
 #include <linux/uaccess.h>
 #include <linux/vfio_pci_core.h>
 #include <cxl/cxl.h>
+#include <cxl/cxl_regs.h>
 #include <cxl/hdm.h>
 #include <cxl/pci.h>
 
@@ -35,6 +36,7 @@
  * @await_mem_active: the device reported its memory active at bind, so wait
  *	for Memory_Active before host access reopens after a reset or low power
  * @mem_region_index: vfio region index of the HDM memory region while open, else 0
+ * @hdm_open_at_prepare: @hdm_valid as reset_prepare found it; under memory_lock
  */
 struct vfio_cxl_state {
 	struct cxl_dev_state cxlds;
@@ -48,6 +50,7 @@ struct vfio_cxl_state {
 	bool hdm_valid;
 	bool await_mem_active;
 	unsigned int mem_region_index;
+	bool hdm_open_at_prepare;
 };
 
 static unsigned long vfio_cxl_mem_pgoff(struct vm_area_struct *vma,
@@ -684,15 +687,6 @@ static void vfio_cxl_close_device(struct vfio_pci_core_device *vdev)
 	cxl->mem_region_index = 0;
 }
 
-static void vfio_cxl_reset_prepare(struct vfio_pci_core_device *vdev)
-{
-}
-
-static int vfio_cxl_reset_done(struct vfio_pci_core_device *vdev)
-{
-	return 0;
-}
-
 /*
  * Take the HDM memory region out of use: zap its mmaps and revoke its
  * dma-bufs. A fault then gets SIGBUS from vfio_cxl_mem_huge_fault() until
@@ -756,6 +750,33 @@ static int vfio_cxl_reset(struct vfio_pci_core_device *vdev)
 	return pci_cxl_reset_owned(vdev->pdev, vdev->cxl->hpa_res);
 }
 
+/*
+ * Report whether the device still decodes its HDM range: memory decode on,
+ * CXL.mem enabled in the CXL Device DVSEC and the decoder committed. A
+ * secondary bus reset or a link down clears all three. Config space is read
+ * first; the decoder registers sit in a BAR and are read only while memory
+ * decode is on.
+ */
+static bool vfio_cxl_hdm_intact(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	struct pci_dev *pdev = vdev->pdev;
+	u16 cmd, ctrl;
+	u32 dctrl;
+
+	if (pci_read_config_word(pdev, PCI_COMMAND, &cmd) ||
+	    PCI_POSSIBLE_ERROR(cmd) || !(cmd & PCI_COMMAND_MEMORY))
+		return false;
+
+	if (pci_read_config_word(pdev, cxl->hdm->dvsec + PCI_DVSEC_CXL_CTRL,
+				 &ctrl) ||
+	    PCI_POSSIBLE_ERROR(ctrl) || !(ctrl & PCI_DVSEC_CXL_MEM_ENABLE))
+		return false;
+
+	dctrl = readl(cxl->hdm_regs + CXL_HDM_DECODER0_CTRL_OFFSET(0));
+	return dctrl != U32_MAX && (dctrl & CXL_HDM_DECODER0_CTRL_COMMITTED);
+}
+
 /* Low power loses the committed decoder: close host access until restored. */
 static void vfio_cxl_power_down(struct vfio_pci_core_device *vdev)
 {
@@ -769,6 +790,16 @@ static void vfio_cxl_power_up(struct vfio_pci_core_device *vdev)
 	int ret;
 
 	lockdep_assert_held_write(&vdev->memory_lock);
+
+	/*
+	 * A D3 request that failed, or a quirk that kept the device in D0,
+	 * lost nothing: reopen without decommitting and recommitting.
+	 */
+	if (vfio_cxl_hdm_intact(vdev)) {
+		if (!vfio_cxl_await_mem_active(vdev))
+			vfio_cxl_rearm_hdm(vdev);
+		return;
+	}
 
 	/*
 	 * Restore the decoder that low power lost. The restore needs the device
@@ -793,6 +824,112 @@ static void vfio_cxl_power_up(struct vfio_pci_core_device *vdev)
 	}
 }
 
+/* A PCI core reset may clear the decoder: take the HDM region out of use. */
+static void vfio_cxl_reset_prepare(struct vfio_pci_core_device *vdev)
+{
+	vdev->cxl->hdm_open_at_prepare = vdev->cxl->hdm_valid;
+	vfio_cxl_revoke_hdm(vdev);
+}
+
+/*
+ * A secondary bus reset only reaches a CXL endpoint when the upstream port
+ * has SBR unmasked (CXL r4.0 sec 8.1.5.2); otherwise the Bridge Control SBR
+ * bit is ignored and the decoder is left intact. Mirrors the cxl_sbr_masked()
+ * check the PCI core uses for its own CXL bus reset.
+ */
+static bool vfio_cxl_sbr_unmasked(struct pci_dev *pdev)
+{
+	struct pci_dev *bridge = pci_upstream_bridge(pdev);
+	u16 dvsec, ctl;
+
+	if (!bridge)
+		return false;
+
+	dvsec = pci_find_dvsec_capability(bridge, PCI_VENDOR_ID_CXL,
+					  PCI_DVSEC_CXL_PORT);
+	if (!dvsec)
+		return false;
+
+	if (pci_read_config_word(bridge, dvsec + PCI_DVSEC_CXL_PORT_CTL, &ctl))
+		return false;
+
+	return ctl & PCI_DVSEC_CXL_PORT_CTL_UNMASK_SBR;
+}
+
+static int vfio_cxl_reset_done(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	struct pci_dev *pdev = vdev->pdev;
+	int ret;
+
+	lockdep_assert_held_write(&vdev->memory_lock);
+
+	/*
+	 * VFIO_DEVICE_PCI_HOT_RESET drives a plain secondary bus reset, not the
+	 * CXL-aware cxl_reset_bus_function(). When the upstream port has SBR
+	 * unmasked the reset decommits the decoder. The PCI core has restored
+	 * config space by now; restore the decoder with the same helper its
+	 * cxl_bus reset method uses. A masked port refuses the bus reset. Other
+	 * resets (FLR, the cxl_reset and cxl_bus methods) leave the decoder
+	 * committed or restore it themselves; restore only a decoder that is
+	 * gone, so a committed one is not decommitted and committed again.
+	 */
+	if (vfio_cxl_sbr_unmasked(pdev) && !vfio_cxl_hdm_intact(vdev)) {
+		ret = pci_save_state(pdev);
+		if (!ret)
+			ret = cxl_restore_state_after_pci_reset(pdev, cxl->hdm);
+		if (ret) {
+			pci_warn(pdev, "vfio-cxl: HDM decoder restore failed: %d\n",
+				 ret);
+			vfio_cxl_sync_mem_enable(vdev);
+			return ret;
+		}
+	} else if (!cxl->hdm_open_at_prepare) {
+		/*
+		 * reset_done runs even when the reset method failed. Nothing
+		 * restored the decoder, and it was not known good before this
+		 * reset (a failed reset or a skipped restore closed the gate),
+		 * so keep host access closed.
+		 */
+		return 0;
+	}
+
+	ret = vfio_cxl_await_mem_active(vdev);
+	if (ret)
+		return ret;
+
+	vfio_cxl_rearm_hdm(vdev);
+	return 0;
+}
+
+/*
+ * AER or DPC recovery resumes the device without restoring its config space,
+ * so do not restore the decoder here. Put the HDM region back only if the
+ * device still decodes it; otherwise the user's reset restores it.
+ */
+static void vfio_cxl_error_resume(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+
+	lockdep_assert_held_write(&vdev->memory_lock);
+
+	/* Low power closed the region; vfio_cxl_power_up() reopens it. */
+	if (pdev->current_state != PCI_D0)
+		return;
+
+	/* The region was closed before the error; keep it that way. */
+	if (!vdev->cxl->hdm_open_at_prepare)
+		return;
+
+	if (!vfio_cxl_hdm_intact(vdev)) {
+		pci_warn(pdev, "vfio-cxl: HDM decoder lost in error recovery, reset the device to restore it\n");
+		return;
+	}
+
+	if (!vfio_cxl_await_mem_active(vdev))
+		vfio_cxl_rearm_hdm(vdev);
+}
+
 static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.init		= vfio_cxl_init_device,
 	.release	= vfio_cxl_release_device,
@@ -800,6 +937,7 @@ static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.close_device	= vfio_cxl_close_device,
 	.reset_prepare	= vfio_cxl_reset_prepare,
 	.reset_done	= vfio_cxl_reset_done,
+	.error_resume	= vfio_cxl_error_resume,
 	.reset		= vfio_cxl_reset,
 	.power_down	= vfio_cxl_power_down,
 	.power_up	= vfio_cxl_power_up,
