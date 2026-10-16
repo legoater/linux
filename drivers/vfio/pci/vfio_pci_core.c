@@ -2449,6 +2449,7 @@ static bool vfio_pci_is_cxl_type2(struct pci_dev *pdev)
  */
 static int vfio_pci_core_cxl_init(struct vfio_pci_core_device *vdev)
 {
+	const struct pci_error_handlers *err_handler;
 	const struct vfio_cxl_ops *ops;
 	int ret;
 
@@ -2459,6 +2460,23 @@ static int vfio_pci_core_cxl_init(struct vfio_pci_core_device *vdev)
 	ops = vfio_pci_get_cxl_ops();
 	if (!ops)
 		return IS_BUILTIN(CONFIG_VFIO_CXL) ? -EPROBE_DEFER : 0;
+
+	/*
+	 * The provider must see every PCI core reset of the device and every
+	 * AER or DPC recovery. A driver without reset_prepare, reset_done,
+	 * error_detected and resume callbacks gets no CXL support; the driver's
+	 * callbacks must call vfio_pci_core_reset_prepare(), _reset_done(),
+	 * _error_detected() and _error_resume().
+	 */
+	err_handler = vdev->pdev->driver ? vdev->pdev->driver->err_handler : NULL;
+	if (!err_handler || !err_handler->reset_prepare ||
+	    !err_handler->reset_done || !err_handler->error_detected ||
+	    !err_handler->resume) {
+		pci_info(vdev->pdev,
+			 "driver lacks PCI reset or error recovery hooks, continuing without CXL support\n");
+		vfio_pci_put_cxl_ops(ops);
+		return 0;
+	}
 
 	ret = ops->init(vdev);
 	/*
@@ -2739,6 +2757,128 @@ out_unlock:
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_sriov_configure);
 
+/*
+ * Take memory_lock for a reset that the PCI core runs on a locked device.
+ * pci_dev_lock() also blocks user config access, and vfio_basic_config_write()
+ * holds memory_lock while its pci_user_*_config() calls wait for that block
+ * to clear. Waiting for memory_lock with config access blocked would hang
+ * both tasks, so let user config access through while waiting: the PCI core
+ * calls reset_prepare before it saves or touches the device. The caller holds
+ * the device lock, so a block found set is the caller's own.
+ */
+static void vfio_pci_reset_lock_memory(struct vfio_pci_core_device *vdev)
+{
+	struct pci_dev *pdev = vdev->pdev;
+
+	if (down_write_trylock(&vdev->memory_lock))
+		return;
+
+	/* The caller did not block config access: nothing to release. */
+	if (pci_cfg_access_trylock(pdev)) {
+		pci_cfg_access_unlock(pdev);
+		down_write(&vdev->memory_lock);
+		return;
+	}
+
+	pci_cfg_access_unlock(pdev);
+	down_write(&vdev->memory_lock);
+	pci_cfg_access_lock(pdev);
+}
+
+/**
+ * vfio_pci_core_reset_prepare() - prepare a device for a PCI core reset
+ * @vdev: vfio PCI device about to be reset
+ *
+ * Call from the driver's pci_error_handlers.reset_prepare callback.
+ */
+void vfio_pci_core_reset_prepare(struct vfio_pci_core_device *vdev)
+{
+	if (!vdev->cxl_ops)
+		return;
+
+	/*
+	 * vfio-pci-core holds memory_lock across its own hot reset. Hold it
+	 * across a reset started anywhere else too, until reset_done. Test
+	 * the owner, not just a flag: another task can reset the device while
+	 * a hot reset holds memory_lock and has not yet locked the device.
+	 */
+	if (READ_ONCE(vdev->hot_reset_task) != current)
+		vfio_pci_reset_lock_memory(vdev);
+
+	vdev->cxl_ops->reset_prepare(vdev);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_reset_prepare);
+
+/**
+ * vfio_pci_core_reset_done() - restore a device after a PCI core reset
+ * @vdev: vfio PCI device that was reset
+ *
+ * Call from the driver's pci_error_handlers.reset_done callback.
+ */
+void vfio_pci_core_reset_done(struct vfio_pci_core_device *vdev)
+{
+	int ret;
+
+	if (!vdev->cxl_ops)
+		return;
+
+	ret = vdev->cxl_ops->reset_done(vdev);
+
+	/*
+	 * hot_reset_task cannot change since reset_prepare: setting it needs
+	 * memory_lock, which this task or the hot reset task holds.
+	 */
+	if (READ_ONCE(vdev->hot_reset_task) == current) {
+		/* VFIO_DEVICE_PCI_HOT_RESET returns the error. */
+		vdev->reset_done_err = ret;
+		return;
+	}
+
+	/*
+	 * Nobody waits for the result of a reset started elsewhere. A provider
+	 * that failed has logged it and keeps its device memory out of use
+	 * until a later reset restores the device.
+	 */
+	up_write(&vdev->memory_lock);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_reset_done);
+
+/**
+ * vfio_pci_core_error_detected() - prepare a device for AER or DPC recovery
+ * @vdev: vfio PCI device the recovery reports an error on
+ *
+ * Call from the driver's pci_error_handlers.error_detected callback. The
+ * recovery may reset the device without reset_prepare and reset_done, so a
+ * provider takes its device memory out of use here.
+ */
+void vfio_pci_core_error_detected(struct vfio_pci_core_device *vdev)
+{
+	if (!vdev->cxl_ops)
+		return;
+
+	guard(rwsem_write)(&vdev->memory_lock);
+	vdev->cxl_ops->reset_prepare(vdev);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_error_detected);
+
+/**
+ * vfio_pci_core_error_resume() - resume a device after AER or DPC recovery
+ * @vdev: vfio PCI device the recovery resumes
+ *
+ * Call from the driver's pci_error_handlers.resume callback. A provider puts
+ * its device memory back if the device still decodes it; otherwise the memory
+ * stays out of use until the user resets the device.
+ */
+void vfio_pci_core_error_resume(struct vfio_pci_core_device *vdev)
+{
+	if (!vdev->cxl_ops || !vdev->cxl_ops->error_resume)
+		return;
+
+	guard(rwsem_write)(&vdev->memory_lock);
+	vdev->cxl_ops->error_resume(vdev);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_error_resume);
+
 static bool vfio_dev_in_groups(struct vfio_device *vdev,
 			       struct vfio_pci_group_info *groups)
 {
@@ -2890,6 +3030,8 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 			ret = -EBUSY;
 			break;
 		}
+		WRITE_ONCE(vdev->hot_reset_task, current);
+		vdev->reset_done_err = 0;
 
 		vfio_pci_dma_buf_move(vdev, true);
 		vfio_pci_zap_bars(vdev);
@@ -2915,6 +3057,17 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 
 	ret = pci_reset_bus(pdev);
 
+	/* A provider that could not restore its device fails the hot reset. */
+	if (!ret) {
+		list_for_each_entry(vdev, &dev_set->device_list,
+				    vdev.dev_set_list) {
+			if (vdev->reset_done_err) {
+				ret = vdev->reset_done_err;
+				break;
+			}
+		}
+	}
+
 	vdev = list_last_entry(&dev_set->device_list,
 			       struct vfio_pci_core_device, vdev.dev_set_list);
 
@@ -2923,6 +3076,7 @@ err_undo:
 					 vdev.dev_set_list) {
 		if (vdev->vdev.open_count && __vfio_pci_memory_enabled(vdev))
 			vfio_pci_dma_buf_move(vdev, false);
+		WRITE_ONCE(vdev->hot_reset_task, NULL);
 		up_write(&vdev->memory_lock);
 	}
 
