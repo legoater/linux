@@ -96,7 +96,8 @@ struct cxl_hdm_quiesce {
 void cxl_region_quiesce_lock(void);
 void cxl_region_quiesce_unlock(void);
 int cxl_hdm_quiesce_prepare(struct device *dev, struct cxl_hdm_quiesce *q,
-			    const struct cxl_hdm_info *snapshot)
+			    const struct cxl_hdm_info *snapshot,
+			    const struct resource *owned)
 	__must_hold(cxl_region_quiesce);
 int cxl_hdm_quiesce_flush(struct cxl_hdm_quiesce *q)
 	__must_hold(cxl_region_quiesce);
