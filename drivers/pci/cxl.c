@@ -373,8 +373,31 @@ static int cxl_reset_save_restored_state(struct pci_dev *pdev, u16 command)
 }
 
 /**
+ * pci_cxl_hdm_snapshot() - copy the HDM state cached at enumeration
+ * @pdev: CXL device
+ *
+ * The cache is read under cxl_rwsem.dpa, so the caller needs no device
+ * lock. A driver can call this from probe, which the PCI core may run in a
+ * worker on the device's NUMA node while the binding task holds the lock.
+ *
+ * Return: a copy to free with kfree(); NULL when @pdev has no cached HDM
+ * state; or an ERR_PTR() on failure.
+ */
+struct cxl_hdm_info *pci_cxl_hdm_snapshot(struct pci_dev *pdev)
+{
+	struct cxl_hdm_info *snapshot;
+
+	snapshot = cxl_hdm_cache_snapshot(&pdev->hdm);
+	if (IS_ERR(snapshot) && PTR_ERR(snapshot) == -ENXIO)
+		return NULL;
+
+	return snapshot;
+}
+EXPORT_SYMBOL_FOR_MODULES(pci_cxl_hdm_snapshot, "vfio-cxl");
+
+/**
  * pci_cxl_reset_prepare() - allocate HDM state storage ahead of a bus reset
- * @pdev: device about to be reset
+ * @pdev: device about to be reset, with its device lock held
  *
  * Copy the cached HDM state before the reset, so that restoring cannot fail
  * for lack of memory. The decoder settings are refreshed when the state is
@@ -386,14 +409,8 @@ static int cxl_reset_save_restored_state(struct pci_dev *pdev, u16 command)
  */
 struct cxl_hdm_info *pci_cxl_reset_prepare(struct pci_dev *pdev)
 {
-	struct cxl_hdm_info *snapshot;
-
 	device_lock_assert(&pdev->dev);
-	snapshot = cxl_hdm_cache_snapshot(&pdev->hdm);
-	if (IS_ERR(snapshot) && PTR_ERR(snapshot) == -ENXIO)
-		return NULL;
-
-	return snapshot;
+	return pci_cxl_hdm_snapshot(pdev);
 }
 
 /**
@@ -433,6 +450,7 @@ int cxl_restore_state_after_pci_reset(struct pci_dev *pdev,
 	cxl_region_quiesce_unlock();
 	return rc;
 }
+EXPORT_SYMBOL_FOR_MODULES(cxl_restore_state_after_pci_reset, "vfio-cxl");
 
 /*
  * CXL r4.0 sec 9.7.2 defines the reset completion timeout encodings.
@@ -642,7 +660,8 @@ static int __cxl_reset_execute(struct pci_dev *pdev, int dvsec, u16 cap,
 	return rc;
 }
 
-static int cxl_reset_quiesced(struct pci_dev *pdev, int dvsec, u16 cap)
+static int cxl_reset_quiesced(struct pci_dev *pdev, int dvsec, u16 cap,
+			      const struct resource *owned)
 	__must_hold(cxl_region_quiesce)
 {
 	struct cxl_hdm_info *snapshot __free(kfree) = NULL;
@@ -663,7 +682,7 @@ static int cxl_reset_quiesced(struct pci_dev *pdev, int dvsec, u16 cap)
 		return PTR_ERR(snapshot);
 	}
 
-	rc = cxl_hdm_quiesce_prepare(&pdev->dev, &q, snapshot);
+	rc = cxl_hdm_quiesce_prepare(&pdev->dev, &q, snapshot, owned);
 	if (rc) {
 		cxl_hdm_quiesce_destroy(&q);
 		return rc;
@@ -686,32 +705,40 @@ static int cxl_reset_quiesced(struct pci_dev *pdev, int dvsec, u16 cap)
 	return cxl_reset_save_restored_state(pdev, command);
 }
 
-static int cxl_reset_execute(struct pci_dev *pdev, int dvsec, u16 cap)
+static int cxl_reset_execute(struct pci_dev *pdev, int dvsec, u16 cap,
+			     const struct resource *owned)
 {
 	int rc;
 
+	/* Raw reset callers may not have saved the PCI state needed for restore. */
+	if (!pdev->state_saved) {
+		pci_err(pdev, "CXL reset requires saved PCI state\n");
+		return -EINVAL;
+	}
+
 	cxl_region_quiesce_lock();
-	rc = cxl_reset_quiesced(pdev, dvsec, cap);
+	rc = cxl_reset_quiesced(pdev, dvsec, cap, owned);
 	cxl_region_quiesce_unlock();
 
 	return rc;
 }
 
-int cxl_reset_function(struct pci_dev *pdev, bool probe)
+static int cxl_reset_check(struct pci_dev *pdev, bool probe, u16 *dvsec,
+			   u16 *cap)
 {
-	u16 dvsec, cap, ctrl;
+	u16 ctrl;
 	int rc;
 
-	rc = cxl_pci_device_dvsec(pdev, &dvsec, &cap);
+	rc = cxl_pci_device_dvsec(pdev, dvsec, cap);
 	if (rc)
 		return probe ? -ENOTTY : rc;
-	if (!(cap & PCI_DVSEC_CXL_CACHE_CAPABLE) ||
-	    !(cap & PCI_DVSEC_CXL_MEM_CAPABLE) ||
-	    !(cap & PCI_DVSEC_CXL_RST_CAPABLE) ||
-	    !(cap & PCI_DVSEC_CXL_RST_MEM_CLR_CAPABLE))
+	if (!(*cap & PCI_DVSEC_CXL_CACHE_CAPABLE) ||
+	    !(*cap & PCI_DVSEC_CXL_MEM_CAPABLE) ||
+	    !(*cap & PCI_DVSEC_CXL_RST_CAPABLE) ||
+	    !(*cap & PCI_DVSEC_CXL_RST_MEM_CLR_CAPABLE))
 		return -ENOTTY;
 
-	rc = pci_read_config_word(pdev, dvsec + PCI_DVSEC_CXL_CTRL, &ctrl);
+	rc = pci_read_config_word(pdev, *dvsec + PCI_DVSEC_CXL_CTRL, &ctrl);
 	if (rc)
 		return probe ? -ENOTTY : pcibios_err_to_errno(rc);
 	if (PCI_POSSIBLE_ERROR(ctrl))
@@ -737,11 +764,70 @@ int cxl_reset_function(struct pci_dev *pdev, bool probe)
 	if (!cpu_cache_has_invalidate_memregion())
 		return -ENOTTY;
 
-	/* Raw reset callers may not have saved the PCI state needed for restore. */
-	if (!pdev->state_saved) {
-		pci_err(pdev, "CXL reset requires saved PCI state\n");
-		return -EINVAL;
-	}
-
-	return cxl_reset_execute(pdev, dvsec, cap);
+	return 0;
 }
+
+int cxl_reset_function(struct pci_dev *pdev, bool probe)
+{
+	u16 dvsec, cap;
+	int rc;
+
+	rc = cxl_reset_check(pdev, probe, &dvsec, &cap);
+	if (rc || probe)
+		return rc;
+
+	return cxl_reset_execute(pdev, dvsec, cap, NULL);
+}
+
+/**
+ * pci_cxl_reset_capable() - check whether CXL Reset can run on a device now
+ * @pdev: CXL device
+ *
+ * Unlike the reset-method probe, this also checks the cached HDM state and
+ * the CPU cache invalidation that the reset needs.
+ *
+ * Return: true when pci_cxl_reset_owned() can attempt the reset.
+ */
+bool pci_cxl_reset_capable(struct pci_dev *pdev)
+{
+	u16 dvsec, cap;
+
+	return !cxl_reset_check(pdev, false, &dvsec, &cap);
+}
+EXPORT_SYMBOL_FOR_MODULES(pci_cxl_reset_capable, "vfio-cxl");
+
+/**
+ * pci_cxl_reset_owned() - CXL Reset for the driver that owns the HDM range
+ * @pdev: CXL device, with its device lock held and PCI state saved
+ * @owned: resource the caller reserved over the device's HPA range with
+ *	   request_mem_region_exclusive(), or NULL
+ *
+ * Run the same sequence as the cxl_reset method. Ranges inside @owned are not
+ * requested again, so a driver that keeps the HPA range reserved while it
+ * exposes the memory can reset the device. The CPU caches are still
+ * invalidated for every range before and after the reset.
+ *
+ * Return: 0 on success, or a negative errno. Unlike the reset method, a
+ * device that cannot be reset returns an error to the caller instead of
+ * falling through to another reset method. -EINVAL if @owned is not a busy,
+ * exclusive reservation.
+ */
+int pci_cxl_reset_owned(struct pci_dev *pdev, const struct resource *owned)
+{
+	const unsigned long held = IORESOURCE_BUSY | IORESOURCE_EXCLUSIVE;
+	u16 dvsec, cap;
+	int rc;
+
+	device_lock_assert(&pdev->dev);
+
+	/* Only a busy, exclusive reservation keeps other users off the range. */
+	if (owned && WARN_ON_ONCE((owned->flags & held) != held))
+		return -EINVAL;
+
+	rc = cxl_reset_check(pdev, false, &dvsec, &cap);
+	if (rc)
+		return rc;
+
+	return cxl_reset_execute(pdev, dvsec, cap, owned);
+}
+EXPORT_SYMBOL_FOR_MODULES(pci_cxl_reset_owned, "vfio-cxl");
