@@ -591,6 +591,15 @@ static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 	if (!hdm)
 		return -ENODEV;
 
+	dev_dbg(&pdev->dev,
+		"decoder_count=%d iw=%d flags=0x%lx hpa=[%#llx-%#llx] global_ctrl=0x%x dvsec_ctrl=0x%x\n",
+		 hdm->decoder_count,
+		 hdm->settings[0].config.interleave_ways,
+		 hdm->settings[0].config.flags,
+		 hdm->settings[0].config.hpa_range.start,
+		 hdm->settings[0].config.hpa_range.end,
+		 hdm->global_ctrl, hdm->dvsec_ctrl);
+
 	/* The guest drives one virtual decoder; multiple are unsupported. */
 	if (hdm->decoder_count != 1)
 		return -EOPNOTSUPP;
@@ -598,6 +607,9 @@ static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 	/* An interleaved decoder cannot be mapped 1:1 to the guest. */
 	if (hdm->settings[0].config.interleave_ways != 1)
 		return -EOPNOTSUPP;
+
+	dev_dbg(&pdev->dev, "pci_cxl_reset_capable=%d\n",
+		 pci_cxl_reset_capable(pdev));
 
 	/*
 	 * The guest drives resets through the CXL Device DVSEC and polls the
