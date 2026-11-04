@@ -761,8 +761,12 @@ static int cxl_reset_check(struct pci_dev *pdev, bool probe, u16 *dvsec,
 	if (cxl_hdm_cache_dvsec_decode(&pdev->hdm))
 		return -ENOTTY;
 
-	if (!cpu_cache_has_invalidate_memregion())
-		return -ENOTTY;
+	if (!cpu_cache_has_invalidate_memregion()) {
+		if (!IS_ENABLED(CONFIG_CXL_REGION_INVALIDATION_TEST))
+			return -ENOTTY;
+		dev_info_once(&pdev->dev,
+			      "Bypassing cpu_cache_invalidate_memregion() for testing!\n");
+	}
 
 	return 0;
 }
