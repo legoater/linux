@@ -303,6 +303,11 @@ static int cxl_hdm_ranges_invalidate(struct cxl_hdm_quiesce *q)
 
 	lockdep_assert_held_write(&cxl_rwsem.region);
 
+	if (!cpu_cache_has_invalidate_memregion()) {
+		if (IS_ENABLED(CONFIG_CXL_REGION_INVALIDATION_TEST))
+			return 0;
+	}
+
 	list_for_each_entry(range, &q->ranges, list) {
 		const struct range *hpa_range = &range->hpa_range;
 		int rc2;
@@ -344,8 +349,12 @@ int cxl_hdm_quiesce_prepare(struct device *dev, struct cxl_hdm_quiesce *q,
 	INIT_LIST_HEAD(&q->ranges);
 
 	if (!cpu_cache_has_invalidate_memregion()) {
-		dev_err(dev, "CPU cache invalidation unavailable\n");
-		return -ENXIO;
+		if (!IS_ENABLED(CONFIG_CXL_REGION_INVALIDATION_TEST)) {
+			dev_err(dev, "CPU cache invalidation unavailable\n");
+			return -ENXIO;
+		}
+		dev_info_once(dev,
+			      "Bypassing cpu_cache_invalidate_memregion() for testing!\n");
 	}
 
 	rc = cxl_hdm_ranges_collect(q, dev, snapshot);
